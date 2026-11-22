@@ -4,23 +4,24 @@ use agent_chat_reader_core::{
     model::*,
     scan::{self, ScanEvent, SharedWriter},
     search::{SearchCursor, SearchHit, SearchQuery},
+    snapshot::{DocumentSnapshot, SearchSnapshot},
     store::{MessageInfo, Store},
 };
 use anyhow::{Context, Result};
-use notify::{RecursiveMode, Watcher};
 use std::{
+    collections::{HashMap, HashSet},
     fs,
     io::Write,
     ops::Range,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, SyncSender},
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::Duration,
 };
+use tempfile::{TempDir, TempPath};
 use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Clone, Debug)]
@@ -37,7 +38,24 @@ pub enum Event {
         settings: Settings,
     },
     Cached(Vec<Session>),
-    Scan(ScanEvent),
+    CatalogStarted {
+        run_id: u64,
+    },
+    Scan {
+        run_id: u64,
+        event: ScanEvent,
+    },
+    CatalogFinished {
+        run_id: u64,
+    },
+    SearchState {
+        generation: u64,
+        message: String,
+    },
+    SearchFailed {
+        generation: u64,
+        message: String,
+    },
     Document {
         generation: u64,
         key: String,
@@ -65,6 +83,11 @@ pub enum Event {
         complete: bool,
         more: Option<SearchCursor>,
     },
+    OpenHit {
+        generation: u64,
+        hit: SearchHit,
+        permanent: bool,
+    },
     Copied(String),
     Notice(String),
     Error(String),
@@ -74,6 +97,7 @@ enum ReadCommand {
     Open {
         generation: u64,
         session: Box<Session>,
+        reload: bool,
         cancel: Cancellation,
     },
     Chunk {
@@ -91,12 +115,45 @@ enum ReadCommand {
         key: String,
         path: PathBuf,
     },
+    Find {
+        generation: u64,
+        query: SearchQuery,
+        cancel: Cancellation,
+    },
+    ValidateHit {
+        generation: u64,
+        hit: SearchHit,
+        permanent: bool,
+    },
+    Retain(Vec<String>),
+}
+
+struct SearchRequest {
+    generation: u64,
+    query: SearchQuery,
+    cancel: Cancellation,
+}
+
+enum SearchCommand {
+    Global {
+        request: SearchRequest,
+        members: Vec<Session>,
+    },
+    Document {
+        request: SearchRequest,
+        file: Arc<TempPath>,
+    },
+    Page {
+        generation: u64,
+        offset: usize,
+    },
 }
 
 enum ControlCommand {
     Refresh(Vec<PathBuf>, Option<Vec<PathBuf>>),
     Save(Settings),
     Clear,
+    Search(SearchRequest),
 }
 
 pub struct Runtime {
@@ -104,16 +161,24 @@ pub struct Runtime {
     pub catalog_events: Receiver<Event>,
     control: SyncSender<ControlCommand>,
     reader: SyncSender<ReadCommand>,
-    searcher: SyncSender<(u64, SearchQuery, SearchCursor, Cancellation)>,
+    searcher: SyncSender<SearchCommand>,
     stop: Cancellation,
     workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
     settings_lock: Arc<Mutex<()>>,
     settings_path: PathBuf,
+    search_cancel: Mutex<Cancellation>,
+    document_cancel: Mutex<Cancellation>,
 }
 
 impl Drop for Runtime {
     fn drop(&mut self) {
         self.stop.cancel();
+        if let Ok(cancel) = self.search_cancel.lock() {
+            cancel.cancel();
+        }
+        if let Ok(cancel) = self.document_cancel.lock() {
+            cancel.cancel();
+        }
         if let Ok(mut workers) = self.workers.lock() {
             let handles = std::mem::take(&mut *workers);
             drop(workers);
@@ -140,11 +205,17 @@ impl Runtime {
         let settings_lock = Arc::new(Mutex::new(()));
         let worker_settings_lock = settings_lock.clone();
         let settings_path = directory.join("settings.json");
+        let search_sender = searcher.clone();
         let catalog = thread::Builder::new()
             .name("catalog".into())
             .spawn(move || {
-                let result = (|| {
+                let result = (|| -> Result<()> {
                     fs::create_dir_all(&directory)?;
+                    let snapshots = Arc::new(
+                        tempfile::Builder::new()
+                            .prefix("snapshots-")
+                            .tempdir_in(&directory)?,
+                    );
                     let path = directory.join("index.sqlite");
                     let writer = Arc::new(Mutex::new(Store::open(&path)?));
                     let settings_path = directory.join("settings.json");
@@ -159,14 +230,28 @@ impl Runtime {
                         .lock()
                         .map_err(|_| anyhow::anyhow!("Index writer failed"))?
                         .sessions(settings.mode)?;
+                    let mut members: HashMap<_, _> = sessions
+                        .iter()
+                        .cloned()
+                        .map(|session| (session.candidate.key.storage_key(), session))
+                        .collect();
                     let reader = spawn_reader(
                         path.clone(),
                         writer.clone(),
                         read_commands,
+                        search_sender.clone(),
                         sender.clone(),
+                        snapshots.clone(),
                         worker_stop.clone(),
                     )?;
-                    let search = spawn_search(path, searches, sender.clone(), worker_stop.clone())?;
+                    let search = spawn_search(
+                        path,
+                        writer.clone(),
+                        searches,
+                        sender.clone(),
+                        snapshots,
+                        worker_stop.clone(),
+                    )?;
                     child_workers
                         .lock()
                         .map_err(|_| anyhow::anyhow!("Worker registry failed"))?
@@ -187,43 +272,42 @@ impl Runtime {
                         }
                         emit(&catalog_sender, Event::Cached(batch), &worker_stop)?;
                     }
+                    let mut roots = settings.sources;
+                    let mut vscode_roots = settings.vscode_sources;
+                    let mut run_id = 1;
+                    emit(&sender, Event::CatalogStarted { run_id }, &worker_stop)?;
                     let mut scan = Some(begin_scan(
-                        &settings.sources,
-                        settings.vscode_sources.as_deref(),
+                        &roots,
+                        vscode_roots.as_deref(),
                         writer.clone(),
                         &sender,
                         &worker_stop,
                     )?);
-                    let dirty = Arc::new(AtomicBool::new(false));
-                    let mut roots = settings.sources.clone();
-                    let mut vscode_roots = settings.vscode_sources.clone();
-                    let mut watcher = watch_sources(&roots, vscode_roots.as_deref(), dirty.clone(), &sender, &worker_stop);
-                    let mut watch_due = None;
+                    let mut pending: Option<SearchRequest> = None;
                     while !worker_stop.is_cancelled() {
                         while let Ok(command) = commands.try_recv() {
                             match command {
                                 ControlCommand::Refresh(sources, vscode) => {
                                     scan.take();
+                                    roots = sources;
+                                    vscode_roots = vscode;
+                                    run_id += 1;
+                                    emit(&sender, Event::CatalogStarted { run_id }, &worker_stop)?;
                                     scan = Some(begin_scan(
-                                        &sources,
-                                        vscode.as_deref(),
+                                        &roots,
+                                        vscode_roots.as_deref(),
                                         writer.clone(),
                                         &sender,
                                         &worker_stop,
                                     )?);
-                                    roots = sources;
-                                    vscode_roots = vscode;
-                                    watcher =
-                                        watch_sources(&roots, vscode_roots.as_deref(), dirty.clone(), &sender, &worker_stop);
                                 }
                                 ControlCommand::Save(settings) => {
                                     let _guard = worker_settings_lock
                                         .lock()
                                         .map_err(|_| anyhow::anyhow!("Settings writer failed"))?;
-                                    if worker_stop.is_cancelled() {
-                                        continue;
-                                    }
-                                    if let Err(error) = persistence::save(&settings_path, &settings)
+                                    if !worker_stop.is_cancelled()
+                                        && let Err(error) =
+                                            persistence::save(&settings_path, &settings)
                                     {
                                         emit(
                                             &sender,
@@ -233,50 +317,95 @@ impl Runtime {
                                     }
                                 }
                                 ControlCommand::Clear => {
-                                    if let Some(handle) = scan.take() {
-                                        handle.cancel.cancel();
-                                        while !handle.is_finished() {
-                                            while handle.events.try_recv().is_ok() {}
-                                            thread::sleep(Duration::from_millis(5));
-                                        }
-                                    }
+                                    scan.take();
                                     writer
                                         .lock()
                                         .map_err(|_| anyhow::anyhow!("Index writer failed"))?
                                         .clear()?;
-                                    emit(
+                                    members.clear();
+                                    run_id += 1;
+                                    emit(&sender, Event::CatalogStarted { run_id }, &worker_stop)?;
+                                    scan = Some(begin_scan(
+                                        &roots,
+                                        vscode_roots.as_deref(),
+                                        writer.clone(),
                                         &sender,
-                                        Event::Notice(
-                                            "Local index cleared; rebuilding from read-only sources.".into(),
-                                        ),
                                         &worker_stop,
-                                    )?;
-                                    scan = Some(begin_scan(&roots, vscode_roots.as_deref(), writer.clone(), &sender, &worker_stop)?);
+                                    )?);
+                                }
+                                ControlCommand::Search(request) => {
+                                    if let Some(old) = pending.take() {
+                                        old.cancel.cancel();
+                                    }
+                                    if scan.is_some() {
+                                        emit(
+                                            &sender,
+                                            Event::SearchState {
+                                                generation: request.generation,
+                                                message: "等待本轮索引完成…".into(),
+                                            },
+                                            &worker_stop,
+                                        )?;
+                                    }
+                                    pending = Some(request);
                                 }
                             }
                         }
-                        if dirty.swap(false, Ordering::Relaxed) {
-                            watch_due = Some(Instant::now() + Duration::from_millis(500));
-                        }
-                        if watch_due.is_some_and(|due| Instant::now() >= due) {
-                            watch_due = None;
-                            scan.take();
-                            scan = Some(begin_scan(&roots, vscode_roots.as_deref(), writer.clone(), &sender, &worker_stop)?);
-                        }
+                        let mut done = false;
                         if let Some(handle) = &scan {
+                            let mut drained = false;
                             for _ in 0..64 {
                                 match handle.events.try_recv() {
                                     Ok(event) => {
-                                        emit(&catalog_sender, Event::Scan(event), &worker_stop)?
+                                        match &event {
+                                            ScanEvent::Session(session) => {
+                                                members.insert(
+                                                    session.candidate.key.storage_key(),
+                                                    (**session).clone(),
+                                                );
+                                            }
+                                            ScanEvent::Reclassified(replacement) => {
+                                                members.remove(&replacement.previous.storage_key());
+                                            }
+                                            _ => {}
+                                        }
+                                        emit(
+                                            &catalog_sender,
+                                            Event::Scan { run_id, event },
+                                            &worker_stop,
+                                        )?;
                                     }
-                                    Err(_) => break,
+                                    Err(_) => {
+                                        drained = true;
+                                        break;
+                                    }
                                 }
                             }
+                            done = drained && handle.is_finished();
                         }
-                        thread::sleep(Duration::from_millis(25));
+                        if done {
+                            scan.take();
+                            // This shares the FIFO with the last progress events.
+                            emit(
+                                &catalog_sender,
+                                Event::CatalogFinished { run_id },
+                                &worker_stop,
+                            )?;
+                        }
+                        if scan.is_none()
+                            && let Some(request) = pending.take()
+                            && !request.cancel.is_cancelled()
+                        {
+                            search_sender
+                                .send(SearchCommand::Global {
+                                    request,
+                                    members: members.values().cloned().collect(),
+                                })
+                                .context("Search worker closed")?;
+                        }
+                        thread::sleep(Duration::from_millis(20));
                     }
-                    drop(watcher);
-                    Ok::<_, anyhow::Error>(())
+                    Ok(())
                 })();
                 if let Err(error) = result {
                     let _ = emit(&sender, Event::Error(format!("{error:#}")), &worker_stop);
@@ -297,6 +426,8 @@ impl Runtime {
             workers,
             settings_lock,
             settings_path,
+            search_cancel: Mutex::new(Cancellation::default()),
+            document_cancel: Mutex::new(Cancellation::default()),
         }
     }
 
@@ -305,38 +436,68 @@ impl Runtime {
             .try_send(ControlCommand::Refresh(sources, vscode))
             .context("Refresh queue is busy")
     }
-
     pub fn save(&self, settings: Settings) -> Result<()> {
         self.control
             .try_send(ControlCommand::Save(settings))
             .context("Settings queue is busy")
     }
-
     pub fn shutdown(&self, settings: Settings) -> Result<()> {
         self.stop.cancel();
+        self.search_cancel
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Search cancellation failed"))?
+            .cancel();
+        self.document_cancel
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Document cancellation failed"))?
+            .cancel();
         let _guard = self
             .settings_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("Settings writer failed"))?;
         persistence::save(&self.settings_path, &settings)
     }
-
     pub fn clear(&self) -> Result<()> {
         self.control
             .try_send(ControlCommand::Clear)
             .context("Index queue is busy")
     }
-
     pub fn open(&self, generation: u64, session: Session, cancel: Cancellation) -> Result<()> {
+        self.set_document_cancel(&cancel)?;
         self.reader
             .try_send(ReadCommand::Open {
                 generation,
                 session: Box::new(session),
+                reload: false,
                 cancel,
             })
             .context("Document queue is busy")
     }
-
+    pub fn reload(&self, generation: u64, session: Session, cancel: Cancellation) -> Result<()> {
+        self.set_document_cancel(&cancel)?;
+        self.reader
+            .try_send(ReadCommand::Open {
+                generation,
+                session: Box::new(session),
+                reload: true,
+                cancel,
+            })
+            .context("Document queue is busy")
+    }
+    pub fn retain_documents(&self, keys: Vec<String>) -> Result<()> {
+        self.reader
+            .try_send(ReadCommand::Retain(keys))
+            .context("Document queue is busy")
+    }
+    fn set_document_cancel(&self, cancel: &Cancellation) -> Result<()> {
+        let mut previous = self
+            .document_cancel
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Document cancellation failed"))?;
+        previous.cancel();
+        *previous = cancel.clone();
+        Ok(())
+    }
     pub fn chunk(
         &self,
         generation: u64,
@@ -353,7 +514,30 @@ impl Runtime {
             })
             .context("Document queue is busy")
     }
-
+    pub fn copy(&self, rowid: i64) -> Result<()> {
+        self.reader
+            .try_send(ReadCommand::Copy(rowid))
+            .context("Document queue is busy")
+    }
+    pub fn raw(&self, generation: u64, rowid: i64) -> Result<()> {
+        self.reader
+            .try_send(ReadCommand::Raw { generation, rowid })
+            .context("Document queue is busy")
+    }
+    pub fn export(&self, key: String, path: PathBuf) -> Result<()> {
+        self.reader
+            .try_send(ReadCommand::Export { key, path })
+            .context("Document queue is busy")
+    }
+    pub fn validate_hit(&self, generation: u64, hit: SearchHit, permanent: bool) -> Result<()> {
+        self.reader
+            .try_send(ReadCommand::ValidateHit {
+                generation,
+                hit,
+                permanent,
+            })
+            .context("Document queue is busy")
+    }
     pub fn search(
         &self,
         generation: u64,
@@ -361,27 +545,39 @@ impl Runtime {
         cursor: SearchCursor,
         cancel: Cancellation,
     ) -> Result<()> {
-        self.searcher
-            .try_send((generation, query, cursor, cancel))
-            .context("Search queue is busy")
-    }
-
-    pub fn copy(&self, rowid: i64) -> Result<()> {
-        self.reader
-            .try_send(ReadCommand::Copy(rowid))
-            .context("Document queue is busy")
-    }
-
-    pub fn raw(&self, generation: u64, rowid: i64) -> Result<()> {
-        self.reader
-            .try_send(ReadCommand::Raw { generation, rowid })
-            .context("Document queue is busy")
-    }
-
-    pub fn export(&self, key: String, path: PathBuf) -> Result<()> {
-        self.reader
-            .try_send(ReadCommand::Export { key, path })
-            .context("Document queue is busy")
+        if cursor.offset > 0 {
+            self.searcher
+                .try_send(SearchCommand::Page {
+                    generation,
+                    offset: cursor.offset,
+                })
+                .context("Search queue is busy")
+        } else {
+            let mut previous = self
+                .search_cancel
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Search cancellation failed"))?;
+            previous.cancel();
+            *previous = cancel.clone();
+            drop(previous);
+            if query.session.is_some() {
+                self.reader
+                    .try_send(ReadCommand::Find {
+                        generation,
+                        query,
+                        cancel,
+                    })
+                    .context("Document queue is busy")
+            } else {
+                self.control
+                    .try_send(ControlCommand::Search(SearchRequest {
+                        generation,
+                        query,
+                        cancel,
+                    }))
+                    .context("Search queue is busy")
+            }
+        }
     }
 }
 
@@ -413,7 +609,7 @@ fn begin_scan(
     };
     let mut adapters: Vec<Arc<dyn AgentAdapter>> = Vec::new();
     for root in roots {
-        let mut providers: Vec<anyhow::Result<Arc<dyn AgentAdapter>>> = Vec::new();
+        let mut providers: Vec<Result<Arc<dyn AgentAdapter>>> = Vec::new();
         if root.join("session-state").is_dir() {
             providers.push(
                 CopilotCli::new(&root).map(|adapter| Arc::new(adapter) as Arc<dyn AgentAdapter>),
@@ -473,147 +669,286 @@ fn begin_scan(
     scan::start_with_writer(adapters, writer)
 }
 
-fn watch_sources(
-    sources: &[PathBuf],
-    vscode_sources: Option<&[PathBuf]>,
-    dirty: Arc<AtomicBool>,
-    sender: &SyncSender<Event>,
-    stop: &Cancellation,
-) -> Option<notify::RecommendedWatcher> {
-    let result = (|| -> Result<_> {
-        let error_sender = sender.clone();
-        let mut watcher =
-            notify::recommended_watcher(move |event: notify::Result<notify::Event>| match event {
-                Ok(event)
-                    if matches!(
-                        event.kind,
-                        notify::EventKind::Modify(_)
-                            | notify::EventKind::Create(_)
-                            | notify::EventKind::Remove(_)
-                    ) && event.paths.iter().any(|path| {
-                        path.file_name().is_some_and(|name| {
-                            matches!(
-                                name.to_str(),
-                                Some(
-                                    "workspace.yaml"
-                                        | "data.db"
-                                        | "data.db-wal"
-                                        | "session-store.db"
-                                        | "session-store.db-wal"
-                                        | "state.vscdb"
-                                        | "state.vscdb-wal"
-                                )
-                            )
-                        }) || path
-                            .extension()
-                            .is_some_and(|extension| extension == "jsonl")
-                            || path.is_dir()
-                    }) =>
-                {
-                    dirty.store(true, Ordering::Relaxed);
+fn spawn_search(
+    database: PathBuf,
+    writer: SharedWriter,
+    commands: Receiver<SearchCommand>,
+    sender: SyncSender<Event>,
+    directory: Arc<TempDir>,
+    stop: Cancellation,
+) -> Result<JoinHandle<()>> {
+    Ok(thread::Builder::new()
+        .name("literal-search".into())
+        .spawn(move || {
+            let work = || -> Result<()> {
+                let store = Store::open(&database)?;
+                let mut active: Option<(u64, SearchSnapshot, Cancellation)> = None;
+                while !stop.is_cancelled() {
+                    if active
+                        .as_ref()
+                        .is_some_and(|(_, _, cancel)| cancel.is_cancelled())
+                    {
+                        active = None;
+                    }
+                    let command = match commands.recv_timeout(Duration::from_millis(50)) {
+                        Ok(command) => command,
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(_) => break,
+                    };
+                    let (generation, result, cancel) = match command {
+                        SearchCommand::Global {
+                            mut request,
+                            members,
+                        } => {
+                            let generation = request.generation;
+                            if request.cancel.is_cancelled() {
+                                continue;
+                            }
+                            active = None;
+                            request.query.members = Some(
+                                members
+                                    .iter()
+                                    .map(|member| member.candidate.key.storage_key())
+                                    .collect(),
+                            );
+                            let result = (|| -> Result<SearchSnapshot> {
+                                let mut writer = writer
+                                    .lock()
+                                    .map_err(|_| anyhow::anyhow!("Index writer failed"))?;
+                                for (index, member) in members.iter().enumerate() {
+                                    stop.check()?;
+                                    request.cancel.check()?;
+                                    emit(
+                                        &sender,
+                                        Event::SearchState {
+                                            generation,
+                                            message: format!(
+                                                "核对已有会话 {}/{}…",
+                                                index + 1,
+                                                members.len()
+                                            ),
+                                        },
+                                        &stop,
+                                    )?;
+                                    let (_, diagnostics) =
+                                        scan::prepare_known(&mut writer, member, &request.cancel)?;
+                                    for diagnostic in diagnostics {
+                                        emit(
+                                            &sender,
+                                            Event::Notice(diagnostic.description),
+                                            &stop,
+                                        )?;
+                                    }
+                                }
+                                request.cancel.check()?;
+                                emit(
+                                    &sender,
+                                    Event::SearchState {
+                                        generation,
+                                        message: "搜索中…".into(),
+                                    },
+                                    &stop,
+                                )?;
+                                store.with_read_snapshot(|source| {
+                                    drop(writer);
+                                    SearchSnapshot::capture(
+                                        source,
+                                        &request.query,
+                                        directory.path(),
+                                        &request.cancel,
+                                    )
+                                })
+                            })();
+                            if request.cancel.is_cancelled() {
+                                continue;
+                            }
+                            (generation, result, request.cancel)
+                        }
+                        SearchCommand::Document { request, file } => {
+                            if request.cancel.is_cancelled() {
+                                continue;
+                            }
+                            active = None;
+                            let result = Store::open(file.as_ref()).and_then(|store| {
+                                store.with_read_snapshot(|source| {
+                                    SearchSnapshot::capture(
+                                        source,
+                                        &request.query,
+                                        directory.path(),
+                                        &request.cancel,
+                                    )
+                                })
+                            });
+                            if request.cancel.is_cancelled() {
+                                continue;
+                            }
+                            (request.generation, result, request.cancel)
+                        }
+                        SearchCommand::Page { generation, offset } => {
+                            if let Some((current, snapshot, _)) = &active
+                                && *current == generation
+                                && let Err(error) =
+                                    send_page(&sender, generation, snapshot, offset, &stop)
+                            {
+                                emit(
+                                    &sender,
+                                    Event::SearchFailed {
+                                        generation,
+                                        message: format!("{error:#}"),
+                                    },
+                                    &stop,
+                                )?;
+                            }
+                            continue;
+                        }
+                    };
+                    match result {
+                        Ok(snapshot) => {
+                            send_page(&sender, generation, &snapshot, 0, &stop)?;
+                            active = Some((generation, snapshot, cancel));
+                        }
+                        Err(error) => emit(
+                            &sender,
+                            Event::SearchFailed {
+                                generation,
+                                message: format!("{error:#}"),
+                            },
+                            &stop,
+                        )?,
+                    }
                 }
-                Err(error)
-                    if error_sender
-                        .try_send(Event::Error(format!("File watcher failed: {error}")))
-                        .is_err() =>
-                {
-                    tracing::error!("File watcher error could not be delivered to the window");
-                }
-                _ => {}
-            })?;
-        let mut roots = if sources.is_empty() {
-            vec![agent_chat_reader_core::agents::copilot_cli::default_home()?]
-        } else {
-            sources.to_vec()
-        };
-        roots.extend(match vscode_sources {
-            Some(roots) => roots.to_vec(),
-            None => vec![agent_chat_reader_core::agents::vscode::default_user_root()?],
-        });
-        for root in roots {
-            if root.is_dir()
-                && let Err(error) = watcher.watch(&root, RecursiveMode::Recursive)
-            {
-                emit(
-                    sender,
-                    Event::Error(format!(
-                        "Live updates unavailable for {}: {error}",
-                        root.display()
-                    )),
-                    stop,
-                )?;
+                Ok(())
+            };
+            if let Err(error) = work() {
+                let _ = emit(&sender, Event::Error(format!("{error:#}")), &stop);
             }
-        }
-        Ok(watcher)
-    })();
-    match result {
-        Ok(watcher) => Some(watcher),
-        Err(error) => {
-            let _ = emit(
-                sender,
-                Event::Error(format!("Live updates unavailable; use Refresh: {error:#}")),
-                stop,
-            );
-            None
-        }
-    }
+        })?)
+}
+
+fn send_page(
+    sender: &SyncSender<Event>,
+    generation: u64,
+    snapshot: &SearchSnapshot,
+    offset: usize,
+    stop: &Cancellation,
+) -> Result<()> {
+    let (hits, next) = snapshot.page(offset)?;
+    emit(
+        sender,
+        Event::Hits {
+            generation,
+            hits,
+            scanned: snapshot.count,
+            complete: next.is_none(),
+            more: next.map(|offset| SearchCursor {
+                offset,
+                ..Default::default()
+            }),
+        },
+        stop,
+    )
 }
 
 fn spawn_reader(
     database: PathBuf,
     writer: SharedWriter,
     commands: Receiver<ReadCommand>,
+    searcher: SyncSender<SearchCommand>,
     sender: SyncSender<Event>,
+    directory: Arc<TempDir>,
     stop: Cancellation,
 ) -> Result<JoinHandle<()>> {
-    let handle = thread::Builder::new()
+    Ok(thread::Builder::new()
         .name("document-reader".into())
         .spawn(move || {
             let work = || -> Result<()> {
-                let store = Store::open(&database)?;
-                let mut continuation: Option<(u64, Session, Cancellation)> = None;
+                let live = Store::open(&database)?;
+                let mut documents: HashMap<String, DocumentSnapshot> = HashMap::new();
+                let mut active: Option<(u64, String)> = None;
                 while !stop.is_cancelled() {
-                    let command = match commands.recv_timeout(Duration::from_millis(15)) {
+                    let command = match commands.recv_timeout(Duration::from_millis(50)) {
                         Ok(command) => command,
-                        Err(mpsc::RecvTimeoutError::Timeout) => {
-                            if let Some((generation, session, cancel)) = continuation.take() {
-                                ReadCommand::Open {
-                                    generation,
-                                    session: Box::new(session),
-                                    cancel,
-                                }
-                            } else {
-                                continue;
-                            }
-                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
                         Err(_) => break,
                     };
+                    let current = active.as_ref().and_then(|(_, key)| documents.get(key));
                     let result = match command {
                         ReadCommand::Open {
                             generation,
                             session,
+                            reload,
                             cancel,
                         } => {
                             if cancel.is_cancelled() {
                                 continue;
                             }
-                            match open_document(
-                                *session, generation, &cancel, &store, &writer, &sender, &stop,
-                            ) {
-                                Ok(Some(session)) => {
-                                    continuation = Some((generation, session, cancel));
-                                    Ok(())
+                            let key = session.candidate.key.storage_key();
+                            let opened = (|| -> Result<Vec<DocumentMessage>> {
+                                if reload {
+                                    documents.remove(&key);
                                 }
-                                Ok(None) => Ok(()),
-                                Err(_) if cancel.is_cancelled() => Ok(()),
-                                Err(error) => emit(
-                                    &sender,
-                                    Event::DocumentFailed {
-                                        generation,
-                                        message: format!("{error:#}"),
-                                    },
-                                    &stop,
-                                ),
+                                if !documents.contains_key(&key) {
+                                    let mut writer = writer
+                                        .lock()
+                                        .map_err(|_| anyhow::anyhow!("Index writer failed"))?;
+                                    let (prepared, diagnostics) =
+                                        scan::prepare_known(&mut writer, &session, &cancel)?;
+                                    for diagnostic in diagnostics {
+                                        emit(
+                                            &sender,
+                                            Event::Notice(diagnostic.description),
+                                            &stop,
+                                        )?;
+                                    }
+                                    anyhow::ensure!(
+                                        prepared.available && prepared.indexed,
+                                        "{}",
+                                        prepared
+                                            .content_error
+                                            .as_deref()
+                                            .unwrap_or("Local session content is unavailable")
+                                    );
+                                    let snapshot = DocumentSnapshot::capture(
+                                        &writer,
+                                        &key,
+                                        directory.path(),
+                                        &cancel,
+                                    )?;
+                                    documents.insert(key.clone(), snapshot);
+                                }
+                                let snapshot = documents
+                                    .get(&key)
+                                    .context("Document snapshot is unavailable")?;
+                                document_messages(&snapshot.store, &key, &cancel)
+                            })();
+                            if cancel.is_cancelled() {
+                                continue;
+                            }
+                            match opened {
+                                Ok(messages) => {
+                                    active = Some((generation, key.clone()));
+                                    emit(
+                                        &sender,
+                                        Event::Document {
+                                            generation,
+                                            key,
+                                            messages,
+                                            complete: true,
+                                        },
+                                        &stop,
+                                    )
+                                }
+                                Err(error) => {
+                                    active = None;
+                                    emit(
+                                        &sender,
+                                        Event::DocumentFailed {
+                                            generation,
+                                            message: format!("{error:#}"),
+                                        },
+                                        &stop,
+                                    )
+                                }
                             }
                         }
                         ReadCommand::Chunk {
@@ -621,31 +956,59 @@ fn spawn_reader(
                             rowid,
                             part,
                             range,
-                        } => store.chunk(rowid, range.start, range.end).and_then(|text| {
-                            emit(
-                                &sender,
-                                Event::Chunk {
-                                    generation,
-                                    rowid,
-                                    part,
-                                    text,
-                                },
-                                &stop,
-                            )
-                        }),
-                        ReadCommand::Copy(rowid) => store.message(rowid).and_then(|message| {
-                            emit(&sender, Event::Copied(message.content), &stop)
-                        }),
-                        ReadCommand::Raw { generation, rowid } => {
-                            store.original_message(rowid).and_then(|text| {
-                                let parts = chunk_ranges(&text)
-                                    .into_iter()
-                                    .map(|range| text[range].to_owned())
-                                    .collect();
-                                emit(&sender, Event::Raw { generation, parts }, &stop)
-                            })
+                        } => {
+                            if active
+                                .as_ref()
+                                .is_none_or(|(current, _)| *current != generation)
+                            {
+                                continue;
+                            }
+                            current
+                                .context("Document is not open")
+                                .and_then(|document| {
+                                    document.store.chunk(rowid, range.start, range.end)
+                                })
+                                .and_then(|text| {
+                                    emit(
+                                        &sender,
+                                        Event::Chunk {
+                                            generation,
+                                            rowid,
+                                            part,
+                                            text,
+                                        },
+                                        &stop,
+                                    )
+                                })
                         }
-                        ReadCommand::Export { key, path } => export_document(&store, &key, &path)
+                        ReadCommand::Copy(rowid) => current
+                            .context("Document is not open")
+                            .and_then(|document| document.store.message(rowid))
+                            .and_then(|message| {
+                                emit(&sender, Event::Copied(message.content), &stop)
+                            }),
+                        ReadCommand::Raw { generation, rowid } => {
+                            if active
+                                .as_ref()
+                                .is_none_or(|(current, _)| *current != generation)
+                            {
+                                continue;
+                            }
+                            current
+                                .context("Document is not open")
+                                .and_then(|document| document.store.original_message(rowid))
+                                .and_then(|text| {
+                                    let parts = chunk_ranges(&text)
+                                        .into_iter()
+                                        .map(|range| text[range].to_owned())
+                                        .collect();
+                                    emit(&sender, Event::Raw { generation, parts }, &stop)
+                                })
+                        }
+                        ReadCommand::Export { key, path } => documents
+                            .get(&key)
+                            .context("Document is not open")
+                            .and_then(|document| export_document(&document.store, &key, &path))
                             .and_then(|()| {
                                 emit(
                                     &sender,
@@ -653,6 +1016,82 @@ fn spawn_reader(
                                     &stop,
                                 )
                             }),
+                        ReadCommand::Find {
+                            generation,
+                            query,
+                            cancel,
+                        } => {
+                            let file = query
+                                .session
+                                .as_ref()
+                                .and_then(|key| documents.get(key))
+                                .map(|document| document.file.clone());
+                            match file {
+                                Some(file) => searcher
+                                    .send(SearchCommand::Document {
+                                        request: SearchRequest {
+                                            generation,
+                                            query,
+                                            cancel,
+                                        },
+                                        file,
+                                    })
+                                    .context("Search worker closed"),
+                                None => emit(
+                                    &sender,
+                                    Event::SearchFailed {
+                                        generation,
+                                        message: "无法读取 session 内容".into(),
+                                    },
+                                    &stop,
+                                ),
+                            }
+                        }
+                        ReadCommand::ValidateHit {
+                            generation,
+                            hit,
+                            permanent,
+                        } => (if hit.document_snapshot {
+                            documents
+                                .get(&hit.session)
+                                .map(|document| {
+                                    document
+                                        .store
+                                        .readable_message(&hit.session, hit.message_id)
+                                })
+                                .unwrap_or(Ok(false))
+                        } else {
+                            live.readable_message(&hit.session, hit.message_id)
+                        })
+                        .and_then(|valid| {
+                            if valid {
+                                emit(
+                                    &sender,
+                                    Event::OpenHit {
+                                        generation,
+                                        hit,
+                                        permanent,
+                                    },
+                                    &stop,
+                                )
+                            } else {
+                                emit(
+                                    &sender,
+                                    Event::Notice(
+                                        "该搜索结果已失效或内容无法读取，请重新搜索。".into(),
+                                    ),
+                                    &stop,
+                                )
+                            }
+                        }),
+                        ReadCommand::Retain(keys) => {
+                            let keys: HashSet<_> = keys.into_iter().collect();
+                            documents.retain(|key, _| keys.contains(key));
+                            if active.as_ref().is_some_and(|(_, key)| !keys.contains(key)) {
+                                active = None;
+                            }
+                            Ok(())
+                        }
                     };
                     if let Err(error) = result {
                         emit(&sender, Event::Error(format!("{error:#}")), &stop)?;
@@ -663,80 +1102,32 @@ fn spawn_reader(
             if let Err(error) = work() {
                 let _ = emit(&sender, Event::Error(format!("{error:#}")), &stop);
             }
-        })?;
-    Ok(handle)
+        })?)
 }
 
-fn open_document(
-    mut session: Session,
-    generation: u64,
-    cancel: &Cancellation,
+fn document_messages(
     store: &Store,
-    writer: &SharedWriter,
-    sender: &SyncSender<Event>,
-    stop: &Cancellation,
-) -> Result<Option<Session>> {
-    let key = session.candidate.key.storage_key();
-    if let Some(current) = store.session(&key)? {
-        session = current;
-    } else {
-        session.indexed = false;
-        writer
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Index writer failed"))?
-            .upsert_session(&session)?;
-    }
-    let mut continuation = false;
-    anyhow::ensure!(
-        session.available || session.indexed,
-        "No local transcript is available for this session; its metadata is listed for reference"
-    );
-    if !session.indexed {
-        let adapter = agent_chat_reader_core::agents::adapter_for(&session.candidate)?;
-        let cursor = writer
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Index writer failed"))?
-            .resume_cursor(&session)?;
-        cancel.check()?;
-        let batch = adapter.read_batch(&session.candidate, cursor, 256 * 1024, cancel)?;
-        let mut writer = writer
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Index writer failed"))?;
-        cancel.check()?;
-        writer.commit_batch(&mut session, &batch)?;
-        drop(writer);
-        continuation = !batch.eof;
-    }
-    let infos = store.message_infos(&key)?;
-    let mut messages = Vec::with_capacity(infos.len());
-    for info in infos {
-        cancel.check()?;
-        let parts = if info.bytes <= 8192 {
-            std::iter::once(0..info.bytes).collect()
-        } else {
-            chunk_ranges(&store.message(info.rowid)?.content)
-        };
-        let native_id = info.native_id.clone();
-        let attachment_names = info.attachment_names.clone();
-        messages.push(DocumentMessage {
-            info,
-            native_id,
-            parts,
-            attachment_names,
-        });
-    }
-    cancel.check()?;
-    emit(
-        sender,
-        Event::Document {
-            generation,
-            key,
-            messages,
-            complete: session.indexed,
-        },
-        stop,
-    )?;
-    Ok(continuation.then_some(session))
+    key: &str,
+    cancel: &Cancellation,
+) -> Result<Vec<DocumentMessage>> {
+    store
+        .message_infos(key)?
+        .into_iter()
+        .map(|info| {
+            cancel.check()?;
+            let parts = if info.bytes <= 8192 {
+                std::iter::once(0..info.bytes).collect()
+            } else {
+                chunk_ranges(&store.message(info.rowid)?.content)
+            };
+            Ok(DocumentMessage {
+                native_id: info.native_id.clone(),
+                attachment_names: info.attachment_names.clone(),
+                info,
+                parts,
+            })
+        })
+        .collect()
 }
 
 pub fn chunk_ranges(text: &str) -> Vec<Range<usize>> {
@@ -762,77 +1153,16 @@ pub fn chunk_ranges(text: &str) -> Vec<Range<usize>> {
     ranges
 }
 
-fn spawn_search(
-    database: PathBuf,
-    commands: Receiver<(u64, SearchQuery, SearchCursor, Cancellation)>,
-    sender: SyncSender<Event>,
-    stop: Cancellation,
-) -> Result<JoinHandle<()>> {
-    let handle = thread::Builder::new()
-        .name("literal-search".into())
-        .spawn(move || {
-            let work = || -> Result<()> {
-                let store = Store::open(&database)?;
-                while !stop.is_cancelled() {
-                    let (generation, query, mut cursor, cancel) =
-                        match commands.recv_timeout(Duration::from_millis(100)) {
-                            Ok(command) => command,
-                            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                            Err(_) => break,
-                        };
-                    let mut found = 0;
-                    while !stop.is_cancelled() && !cancel.is_cancelled() {
-                        match store.search_page(&query, cursor, &cancel) {
-                            Ok(page) => {
-                                found += page.hits.len();
-                                let pause = found >= 512;
-                                emit(
-                                    &sender,
-                                    Event::Hits {
-                                        generation,
-                                        hits: page.hits,
-                                        scanned: page.scanned,
-                                        complete: page.next.is_none(),
-                                        more: if pause { page.next.clone() } else { None },
-                                    },
-                                    &stop,
-                                )?;
-                                if pause {
-                                    break;
-                                }
-                                match page.next {
-                                    Some(next) => cursor = next,
-                                    None => break,
-                                }
-                            }
-                            Err(error) => {
-                                if !cancel.is_cancelled() {
-                                    emit(&sender, Event::Error(format!("{error:#}")), &stop)?;
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
-                Ok(())
-            };
-            if let Err(error) = work() {
-                let _ = emit(&sender, Event::Error(format!("{error:#}")), &stop);
-            }
-        })?;
-    Ok(handle)
-}
-
 fn export_document(store: &Store, key: &str, path: &Path) -> Result<()> {
     let session = store
         .session(key)?
         .context("Session is no longer indexed")?;
     anyhow::ensure!(
-        session.indexed,
-        "Wait until this session is completely indexed before export"
+        session.available && session.indexed,
+        "无法读取 session 内容"
     );
-    let parent = path.parent().context("Export path has no parent")?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(path.parent().context("Export path has no parent")?)?;
     writeln!(
         temporary,
         "# {}\n\nMain conversation only; system, tool and sub-agent events excluded.\n",
@@ -869,382 +1199,556 @@ fn export_document(store: &Store, key: &str, path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use std::io::Write;
+    use std::time::Instant;
 
-    #[test]
-    fn huge_single_paragraph_chunks_preserve_every_unicode_byte() {
-        let text = "中e\u{301}🙂".repeat(300_000);
-        let ranges = chunk_ranges(&text);
-        assert!(ranges.len() > 100);
-        assert!(ranges.iter().all(|range| range.len() <= 8192));
-        let joined: String = ranges.into_iter().map(|range| &text[range]).collect();
-        assert_eq!(text, joined);
+    const A: &str = "00000000-0000-4000-8000-000000000001";
+    const B: &str = "00000000-0000-4000-8000-000000000002";
+    const MISSING: &str = "00000000-0000-4000-8000-000000000003";
+
+    struct Fixture {
+        directory: TempDir,
+        home: PathBuf,
+        data: PathBuf,
+        settings: Settings,
     }
 
-    fn next_matching(runtime: &Runtime, predicate: impl Fn(&Event) -> bool) -> Event {
-        let started = Instant::now();
+    impl Fixture {
+        fn new(messages: usize, missing: bool) -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let home = directory.path().join("source");
+            let data = directory.path().join("app");
+            fs::create_dir_all(home.join("session-state")).unwrap();
+            fs::create_dir(&data).unwrap();
+            let settings = Settings {
+                sources: vec![home.clone()],
+                vscode_sources: Some(Vec::new()),
+                ..Default::default()
+            };
+            persistence::save(&data.join("settings.json"), &settings).unwrap();
+            let fixture = Self {
+                directory,
+                home,
+                data,
+                settings,
+            };
+            fixture.write_session(A, messages, "needle original");
+            if missing {
+                fs::create_dir(fixture.home.join("session-state").join(MISSING)).unwrap();
+                let db = rusqlite::Connection::open(fixture.home.join("data.db")).unwrap();
+                db.execute_batch(
+                    "CREATE TABLE sessions(id TEXT,title TEXT);
+                    CREATE TABLE workspaces(session_id TEXT,name TEXT);",
+                )
+                .unwrap();
+                db.execute(
+                    "INSERT INTO sessions VALUES(?1,'Unavailable metadata')",
+                    [MISSING],
+                )
+                .unwrap();
+            }
+            fixture
+        }
+
+        fn path(&self, native: &str) -> PathBuf {
+            self.home
+                .join("session-state")
+                .join(native)
+                .join("events.jsonl")
+        }
+
+        fn write_session(&self, native: &str, count: usize, body: &str) {
+            let path = self.path(native);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(
+                path.with_file_name("workspace.yaml"),
+                format!("client_name: github/cli\nname: Synthetic {native}\n"),
+            )
+            .unwrap();
+            let mut file = fs::File::create(path).unwrap();
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({"type":"session.start","timestamp":"2026-01-01T00:00:00Z",
+                "data":{"context":{"cwd":"D:\\synthetic-private-workspace"}}})
+            )
+            .unwrap();
+            for index in 0..count {
+                writeln!(file,"{}",serde_json::json!({"id":format!("message-{index}"),"type":"user.message",
+                    "timestamp":"2026-01-02T00:00:00Z","data":{"content":format!("{body} {index}")}})).unwrap();
+            }
+        }
+
+        fn append(&self, body: &str) {
+            let mut file = fs::File::options().append(true).open(self.path(A)).unwrap();
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({"id":"appended","type":"assistant.message",
+                "timestamp":"2026-02-01T00:00:00Z","data":{"content":body}})
+            )
+            .unwrap();
+        }
+
+        fn close(self, reader: Runtime) {
+            reader.shutdown(self.settings).unwrap();
+            drop(reader);
+            assert!(!fs::read_dir(&self.data).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("snapshots-")
+            }));
+            self.directory.close().unwrap();
+        }
+    }
+
+    fn next(reader: &Runtime, mut predicate: impl FnMut(&Event) -> bool) -> Event {
+        let start = Instant::now();
         loop {
-            if let Ok(event) = runtime
+            if let Ok(event) = reader
                 .events
                 .try_recv()
-                .or_else(|_| runtime.catalog_events.try_recv())
+                .or_else(|_| reader.catalog_events.try_recv())
             {
-                match &event {
-                    Event::Error(error) | Event::DocumentFailed { message: error, .. } => {
-                        panic!("{error}")
-                    }
-                    Event::Scan(ScanEvent::Diagnostic(error)) => panic!("{}", error.description),
-                    _ => {}
+                if let Event::Error(error) | Event::SearchFailed { message: error, .. } = &event {
+                    panic!("{error}");
                 }
                 if predicate(&event) {
                     return event;
                 }
             }
             assert!(
-                started.elapsed() < Duration::from_secs(12),
+                start.elapsed() < Duration::from_secs(15),
                 "Runtime event timed out"
             );
-            thread::sleep(Duration::from_millis(5));
+            thread::sleep(Duration::from_millis(3));
         }
     }
 
-    #[test]
-    fn runtime_reads_exports_and_watches_append_in_isolated_local_data() {
-        let source = tempfile::tempdir().unwrap();
-        let directory = source
-            .path()
-            .join("session-state")
-            .join("00000000-0000-4000-8000-000000000001");
-        fs::create_dir_all(&directory).unwrap();
-        fs::write(
-            directory.join("workspace.yaml"),
-            "client_name: github/cli\nname: Synthetic runtime test\n",
+    fn catalog(reader: &Runtime) -> (Vec<Session>, Vec<scan::ScanProgress>) {
+        let mut sessions = HashMap::new();
+        let mut progress = HashMap::new();
+        next(reader, |event| {
+            match event {
+                Event::Scan {
+                    event: ScanEvent::Session(session),
+                    ..
+                } => {
+                    sessions.insert(session.candidate.key.storage_key(), (**session).clone());
+                }
+                Event::Scan {
+                    event:
+                        ScanEvent::Progress {
+                            source,
+                            progress: value,
+                        },
+                    ..
+                } => {
+                    assert!(value.indexed <= value.indexable && value.scanned <= value.discovered);
+                    progress.insert(source.clone(), value.clone());
+                }
+                _ => {}
+            }
+            matches!(event, Event::CatalogFinished { .. })
+        });
+        (
+            sessions.into_values().collect(),
+            progress.into_values().collect(),
         )
-        .unwrap();
-        let events = directory.join("events.jsonl");
-        let raw = "<system_reminder>internal</system_reminder>\nHello 中文";
-        fs::write(
-            &events,
-            format!(
-                "{}\n{}\n",
-                serde_json::json!({"type":"session.start","timestamp":"2026-01-01T00:00:00Z",
-                "data":{"context":{"cwd":"D:\\synthetic-private-workspace"}}}),
-                serde_json::json!({"type":"user.message","timestamp":"2026-01-01T01:00:00Z",
-                "data":{"content":raw}})
-            ),
-        )
-        .unwrap();
-        let data = tempfile::tempdir().unwrap();
-        let settings = Settings {
-            sources: vec![source.path().to_owned()],
-            vscode_sources: Some(Vec::new()),
-            ..Default::default()
-        };
-        persistence::save(&data.path().join("settings.json"), &settings).unwrap();
-        let runtime = Runtime::new(data.path().to_owned());
-        let event = next_matching(&runtime, |event| {
+    }
+
+    fn hits(reader: &Runtime, generation: u64) -> (Vec<SearchHit>, Option<SearchCursor>, usize) {
+        let event = next(reader, |event| {
             matches!(event,
-            Event::Scan(ScanEvent::Session(session)) if session.indexed)
+            Event::Hits { generation: actual, .. } if *actual == generation)
         });
-        let Event::Scan(ScanEvent::Session(session)) = event else {
-            unreachable!()
-        };
-        let old_size = session.candidate.size;
-        runtime
-            .open(1, (*session).clone(), Cancellation::default())
-            .unwrap();
-        let event = next_matching(&runtime, |event| {
-            matches!(event, Event::Document { generation: 1, .. })
-        });
-        let Event::Document {
-            messages, complete, ..
+        let Event::Hits {
+            hits,
+            more,
+            scanned,
+            ..
         } = event
         else {
             unreachable!()
         };
-        assert!(complete);
-        assert_eq!(messages.len(), 1);
-        let rowid = messages[0].info.rowid;
-        runtime.copy(rowid).unwrap();
-        let event = next_matching(&runtime, |event| matches!(event, Event::Copied(_)));
-        assert!(matches!(event, Event::Copied(text) if text == "Hello 中文"));
-        runtime.raw(1, rowid).unwrap();
-        let event = next_matching(&runtime, |event| {
-            matches!(event, Event::Raw { generation: 1, .. })
-        });
-        assert!(matches!(event, Event::Raw { parts, .. } if parts.concat() == raw));
-        let output = data.path().join("export.md");
-        runtime
-            .export(session.candidate.key.storage_key(), output.clone())
-            .unwrap();
-        next_matching(
-            &runtime,
-            |event| matches!(event, Event::Notice(text) if text.starts_with("Exported")),
-        );
-        let exported = fs::read_to_string(output).unwrap();
-        assert!(exported.contains("Hello 中文"));
-        assert!(!exported.contains("synthetic-private-workspace"));
-        let mut file = fs::OpenOptions::new().append(true).open(&events).unwrap();
-        writeln!(
-            file,
-            "{}",
-            serde_json::json!({"type":"assistant.message",
-            "timestamp":"2026-01-02T00:00:00Z","data":{"content":"Appended response"}})
-        )
-        .unwrap();
-        drop(file);
-        let event = next_matching(&runtime, |event| {
+        (hits, more, scanned)
+    }
+
+    fn opened(reader: &Runtime, generation: u64) -> Vec<DocumentMessage> {
+        let event = next(reader, |event| {
             matches!(event,
-            Event::Scan(ScanEvent::Session(session)) if session.indexed && session.candidate.size > old_size)
+            Event::Document { generation: actual, .. } | Event::DocumentFailed { generation: actual, .. }
+                if *actual == generation)
         });
-        let Event::Scan(ScanEvent::Session(updated)) = event else {
-            unreachable!()
+        let Event::Document { messages, .. } = event else {
+            panic!("Document failed to open")
         };
-        runtime
-            .open(2, (*updated).clone(), Cancellation::default())
-            .unwrap();
-        let event = next_matching(&runtime, |event| {
-            matches!(event, Event::Document { generation: 2, .. })
-        });
-        assert!(
-            matches!(event, Event::Document { messages, complete: true, .. } if messages.len() == 2)
-        );
-        Store::open(&data.path().join("index.sqlite"))
-            .unwrap()
-            .clear()
-            .unwrap();
-        runtime.open(3, *updated, Cancellation::default()).unwrap();
-        let event = next_matching(&runtime, |event| {
-            matches!(event, Event::Document { generation: 3, .. })
-        });
-        assert!(
-            matches!(event, Event::Document { messages, complete: true, .. } if messages.len() == 2)
-        );
-        fs::remove_file(&events).unwrap();
-        let event = next_matching(&runtime, |event| {
-            matches!(event,
-            Event::Scan(ScanEvent::Session(session)) if !session.available)
-        });
-        let Event::Scan(ScanEvent::Session(cached)) = event else {
-            unreachable!()
-        };
-        runtime.open(4, *cached, Cancellation::default()).unwrap();
-        let event = next_matching(&runtime, |event| {
-            matches!(event, Event::Document { generation: 4, .. })
-        });
-        assert!(
-            matches!(event, Event::Document { messages, complete: true, .. } if messages.len() == 2)
-        );
-        runtime.shutdown(settings).unwrap();
-        drop(runtime);
-        data.close().unwrap();
-        source.close().unwrap();
+        messages
     }
 
     #[test]
-    fn runtime_opens_both_desktop_providers_and_refreshes_database_titles_and_snapshot_replies() {
-        let files = tempfile::tempdir().unwrap();
-        let copilot = files.path().join("copilot");
-        let native = "00000000-0000-4000-8000-000000000022";
-        let events = copilot
-            .join("session-state")
-            .join(native)
-            .join("events.jsonl");
-        fs::create_dir_all(events.parent().unwrap()).unwrap();
-        fs::write(&events, format!("{}\n{}\n",
-            serde_json::json!({"type":"session.start","timestamp":"2026-01-01T00:00:00Z","data":{}}),
-            serde_json::json!({"type":"user.message","timestamp":"2026-01-02T00:00:00Z",
-                "data":{"content":"App question 中文"}}))).unwrap();
-        fs::write(
-            events.with_file_name("workspace.yaml"),
-            "client_name: github/cli\nname: Wrong CLI title\n",
-        )
-        .unwrap();
-        let app_db = copilot.join("data.db");
-        let db = rusqlite_for_tests(&app_db);
-        db.execute_batch(
-            "CREATE TABLE sessions(id TEXT,title TEXT);
-            CREATE TABLE workspaces(session_id TEXT,name TEXT);",
-        )
-        .unwrap();
-        db.execute("INSERT INTO sessions VALUES(?1,'App title')", [native])
-            .unwrap();
-        drop(db);
-
-        let code = files.path().join("Code").join("User");
-        let code_id = "00000000-0000-4000-8000-000000000033";
-        let db_path = agent_chat_reader_core::agents::vscode::session_store(&code);
-        fs::create_dir_all(db_path.parent().unwrap()).unwrap();
-        let db = rusqlite_for_tests(&db_path);
-        db.execute_batch("CREATE TABLE sessions(id TEXT,cwd TEXT,host_type TEXT,agent_name TEXT);")
-            .unwrap();
-        db.execute(
-            "INSERT INTO sessions VALUES(?1,'D:\\code','vscode','GitHub Copilot Chat')",
-            [code_id],
-        )
-        .unwrap();
-        drop(db);
-        let transcript = code
-            .join("workspaceStorage")
-            .join("one")
-            .join("chatSessions")
-            .join(format!("{code_id}.jsonl"));
-        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
-        fs::write(&transcript, format!("{}\n", serde_json::json!({"kind":0,"v":{
-            "customTitle":"VS Code title","requests":[{"requestId":"one","timestamp":1767312000000_i64,
-                "responseTimestamp":1767398400000_i64,"message":{"text":"Code question 中文"},
-                "response":[{"value":"Code response"}]}]}}))).unwrap();
-        let data = tempfile::tempdir().unwrap();
-        let settings = Settings {
-            sources: vec![copilot],
-            vscode_sources: Some(vec![code]),
-            ..Default::default()
-        };
-        persistence::save(&data.path().join("settings.json"), &settings).unwrap();
-        let runtime = Runtime::new(data.path().to_owned());
-        let mut providers = HashMap::new();
-        while providers.len() < 2 {
-            let event = next_matching(&runtime, |event| {
-                matches!(event,
-                Event::Scan(ScanEvent::Session(session)) if session.indexed)
-            });
-            let Event::Scan(ScanEvent::Session(session)) = event else {
-                unreachable!()
-            };
-            providers.insert(session.candidate.key.agent.clone(), *session);
-        }
-        assert!(providers.contains_key("copilot-app"));
-        assert!(providers.contains_key("vscode"));
-        for (generation, agent) in [(1, "copilot-app"), (2, "vscode")] {
-            let session = providers[agent].clone();
-            runtime
-                .open(generation, session.clone(), Cancellation::default())
-                .unwrap();
-            let event = next_matching(&runtime, |event| {
-                matches!(event,
-                Event::Document { generation: actual, complete: true, .. } if *actual == generation)
-            });
-            let Event::Document { messages, .. } = event else {
-                unreachable!()
-            };
-            assert!(!messages.is_empty());
-            let export = data.path().join(format!("{agent}.md"));
-            runtime
-                .export(session.candidate.key.storage_key(), export.clone())
-                .unwrap();
-            next_matching(
-                &runtime,
-                |event| matches!(event, Event::Notice(message) if message.starts_with("Exported")),
-            );
-            assert!(fs::read_to_string(export).unwrap().contains("中文"));
-        }
-        let db = rusqlite_for_tests(&app_db);
-        db.execute(
-            "UPDATE sessions SET title='Renamed App title' WHERE id=?1",
-            [native],
-        )
-        .unwrap();
-        drop(db);
-        next_matching(&runtime, |event| {
-            matches!(event,
-            Event::Scan(ScanEvent::Session(session)) if session.indexed && session.name == "Renamed App title")
-        });
-
-        let mut file = fs::OpenOptions::new()
-            .append(true)
-            .open(&transcript)
-            .unwrap();
-        writeln!(
-            file,
-            "{}",
-            serde_json::json!({"kind":1,"k":["requests",0,"response",0,"value"],
-            "v":"Updated Code response 中文"})
-        )
-        .unwrap();
-        drop(file);
-        let old_size = providers["vscode"].candidate.size;
-        let event = next_matching(&runtime, |event| {
-            matches!(event,
-            Event::Scan(ScanEvent::Session(session)) if session.indexed
-                && session.candidate.key.agent=="vscode" && session.candidate.size > old_size)
-        });
-        let Event::Scan(ScanEvent::Session(updated)) = event else {
-            unreachable!()
-        };
-        runtime.open(3, *updated, Cancellation::default()).unwrap();
-        let event = next_matching(&runtime, |event| {
-            matches!(
-                event,
-                Event::Document {
-                    generation: 3,
-                    complete: true,
-                    ..
-                }
-            )
-        });
-        let Event::Document { messages, .. } = event else {
-            unreachable!()
-        };
-        assert_eq!(messages.len(), 2);
-        runtime.copy(messages[1].info.rowid).unwrap();
-        assert!(
-            matches!(next_matching(&runtime,|event| matches!(event,Event::Copied(_))),
-            Event::Copied(text) if text=="Updated Code response 中文")
-        );
-        fs::write(
-            events.with_file_name("workspace.yaml"),
-            "client_name: github/autopilot\nlast_client_name: github/cli\nname: Continued in CLI\n",
-        )
-        .unwrap();
-        let event = next_matching(&runtime, |event| {
-            matches!(event,
-            Event::Scan(ScanEvent::Session(session)) if session.indexed
-                && session.candidate.key.agent == "copilot-cli"
-                && session.candidate.key.native == native)
-        });
-        let Event::Scan(ScanEvent::Session(continued)) = event else {
-            unreachable!()
-        };
-        assert_eq!(continued.name, "Continued in CLI");
-        let store = Store::open(&data.path().join("index.sqlite")).unwrap();
-        assert!(
-            store
-                .session(&providers["copilot-app"].candidate.key.storage_key())
-                .unwrap()
-                .is_none()
+    fn no_automatic_scans_and_new_search_only_prepares_known_members() {
+        let fixture = Fixture::new(1, true);
+        let reader = Runtime::new(fixture.data.clone());
+        let (sessions, progress) = catalog(&reader);
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(
+            progress
+                .iter()
+                .map(|progress| progress.indexable)
+                .sum::<usize>(),
+            1
         );
         assert_eq!(
-            store
-                .sessions(TimeMode::Latest)
-                .unwrap()
+            progress
                 .iter()
-                .filter(|session| session.candidate.key.native == native)
+                .map(|progress| progress.indexed)
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(
+            progress
+                .iter()
+                .map(|progress| progress.unreadable)
+                .sum::<usize>(),
+            1
+        );
+        let unavailable = sessions.iter().find(|session| !session.available).unwrap();
+        reader
+            .open(1, unavailable.clone(), Cancellation::default())
+            .unwrap();
+        let event = next(&reader, |event| {
+            matches!(event, Event::DocumentFailed { generation: 1, .. })
+        });
+        assert!(matches!(event, Event::DocumentFailed { message, .. } if !message.is_empty()));
+        reader
+            .search(
+                1,
+                SearchQuery {
+                    text: "later".into(),
+                    ..Default::default()
+                },
+                SearchCursor::default(),
+                Cancellation::default(),
+            )
+            .unwrap();
+        assert!(hits(&reader, 1).0.is_empty());
+        fixture.append("later needle");
+        fixture.write_session(B, 1, "later hidden new session");
+        fs::create_dir(fixture.home.join("unrelated")).unwrap();
+        thread::sleep(Duration::from_millis(700));
+        while let Ok(event) = reader
+            .events
+            .try_recv()
+            .or_else(|_| reader.catalog_events.try_recv())
+        {
+            assert!(!matches!(
+                event,
+                Event::Scan { .. } | Event::CatalogStarted { .. } | Event::Hits { .. }
+            ));
+        }
+        reader
+            .search(
+                2,
+                SearchQuery {
+                    text: "later".into(),
+                    ..Default::default()
+                },
+                SearchCursor::default(),
+                Cancellation::default(),
+            )
+            .unwrap();
+        let (results, _, _) = hits(&reader, 2);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].session.ends_with(A));
+        let store = Store::open(&fixture.data.join("index.sqlite")).unwrap();
+        assert_eq!(store.sessions(TimeMode::Latest).unwrap().len(), 2);
+        drop(store);
+        fixture.close(reader);
+    }
+
+    #[test]
+    fn pages_and_documents_keep_their_versions_across_manual_refresh_and_reload() {
+        let fixture = Fixture::new(600, false);
+        let reader = Runtime::new(fixture.data.clone());
+        let (sessions, _) = catalog(&reader);
+        let session = sessions[0].clone();
+        reader
+            .open(1, session.clone(), Cancellation::default())
+            .unwrap();
+        let original = opened(&reader, 1);
+        assert_eq!(original.len(), 600);
+        reader
+            .search(
+                1,
+                SearchQuery {
+                    text: "needle".into(),
+                    ..Default::default()
+                },
+                SearchCursor::default(),
+                Cancellation::default(),
+            )
+            .unwrap();
+        let (first, more, _) = hits(&reader, 1);
+        assert_eq!(first.len(), 512);
+        fixture.append("needle addition");
+        fixture.write_session(B, 1, "needle new member");
+        reader
+            .refresh(fixture.settings.sources.clone(), Some(Vec::new()))
+            .unwrap();
+        let (updated, _) = catalog(&reader);
+        assert_eq!(updated.len(), 2);
+        reader
+            .search(
+                1,
+                SearchQuery::default(),
+                more.unwrap(),
+                Cancellation::default(),
+            )
+            .unwrap();
+        let (last, more, total) = hits(&reader, 1);
+        assert_eq!(last.len(), 88);
+        assert_eq!(total, 600);
+        assert!(more.is_none());
+        assert!(last.iter().all(|hit| hit.snippet.contains("original")));
+        reader
+            .open(2, session.clone(), Cancellation::default())
+            .unwrap();
+        assert_eq!(opened(&reader, 2).len(), 600);
+        let last = original.last().unwrap();
+        reader
+            .chunk(2, last.info.rowid, 0, last.parts[0].clone())
+            .unwrap();
+        let event = next(&reader, |event| {
+            matches!(event, Event::Chunk { generation: 2, .. })
+        });
+        assert!(matches!(event, Event::Chunk { text, .. } if text=="needle original 599"));
+        let export = fixture.data.join("old-document.md");
+        reader
+            .export(session.candidate.key.storage_key(), export.clone())
+            .unwrap();
+        next(
+            &reader,
+            |event| matches!(event, Event::Notice(message) if message.starts_with("Exported")),
+        );
+        let markdown = fs::read_to_string(export).unwrap();
+        assert!(
+            !markdown.contains("addition") && !markdown.contains("synthetic-private-workspace")
+        );
+        reader
+            .search(
+                2,
+                SearchQuery {
+                    text: "addition".into(),
+                    session: Some(session.candidate.key.storage_key()),
+                    ..Default::default()
+                },
+                SearchCursor::default(),
+                Cancellation::default(),
+            )
+            .unwrap();
+        assert!(hits(&reader, 2).0.is_empty());
+        reader
+            .reload(3, session.clone(), Cancellation::default())
+            .unwrap();
+        assert_eq!(opened(&reader, 3).len(), 601);
+        reader
+            .search(
+                3,
+                SearchQuery {
+                    text: "addition".into(),
+                    session: Some(session.candidate.key.storage_key()),
+                    ..Default::default()
+                },
+                SearchCursor::default(),
+                Cancellation::default(),
+            )
+            .unwrap();
+        assert_eq!(hits(&reader, 3).0.len(), 1);
+        fixture.close(reader);
+    }
+
+    #[test]
+    fn query_waits_for_catalog_then_executes_once_and_old_hits_report_invalidation() {
+        let fixture = Fixture::new(1, true);
+        let reader = Runtime::new(fixture.data.clone());
+        reader
+            .search(
+                1,
+                SearchQuery {
+                    text: "needle".into(),
+                    ..Default::default()
+                },
+                SearchCursor::default(),
+                Cancellation::default(),
+            )
+            .unwrap();
+        let mut waited = false;
+        let event = next(&reader, |event| {
+            match event {
+                Event::SearchState {
+                    generation: 1,
+                    message,
+                } if message.contains("等待") => waited = true,
+                _ => {}
+            }
+            matches!(event, Event::Hits { generation: 1, .. })
+        });
+        assert!(waited);
+        let terminal = Store::open(&fixture.data.join("index.sqlite"))
+            .unwrap()
+            .sessions(TimeMode::Latest)
+            .unwrap();
+        assert_eq!(terminal.len(), 2);
+        assert_eq!(
+            terminal
+                .iter()
+                .filter(|session| session.available && session.indexed)
                 .count(),
             1
         );
-        runtime
-            .open(4, *continued, Cancellation::default())
-            .unwrap();
-        let event = next_matching(&runtime, |event| {
-            matches!(
-                event,
-                Event::Document {
-                    generation: 4,
-                    complete: true,
-                    ..
-                }
+        assert_eq!(
+            terminal
+                .iter()
+                .filter(|session| !session.available && !session.indexed)
+                .count(),
+            1
+        );
+        let Event::Hits { hits: results, .. } = event else {
+            unreachable!()
+        };
+        assert_eq!(results.len(), 1);
+        let old = results[0].clone();
+        fixture.write_session(A, 1, "replacement content");
+        reader
+            .search(
+                2,
+                SearchQuery {
+                    text: "replacement".into(),
+                    ..Default::default()
+                },
+                SearchCursor::default(),
+                Cancellation::default(),
             )
-        });
-        assert!(matches!(event, Event::Document { messages, .. } if messages.len() == 1));
-        drop(store);
-        runtime.shutdown(settings).unwrap();
-        drop(runtime);
-        data.close().unwrap();
-        files.close().unwrap();
+            .unwrap();
+        assert_eq!(hits(&reader, 2).0.len(), 1);
+        reader.validate_hit(1, old, false).unwrap();
+        next(
+            &reader,
+            |event| matches!(event, Event::Notice(message) if message.contains("失效")),
+        );
+        fixture.close(reader);
     }
 
-    fn rusqlite_for_tests(path: &Path) -> rusqlite::Connection {
-        rusqlite::Connection::open(path).unwrap()
+    #[test]
+    fn missing_previously_indexed_cli_session_stays_visible_and_does_not_inflate_refresh_targets() {
+        let fixture = Fixture::new(1, false);
+        let reader = Runtime::new(fixture.data.clone());
+        catalog(&reader);
+        fs::remove_file(fixture.path(A)).unwrap();
+        for _ in 0..2 {
+            reader
+                .refresh(fixture.settings.sources.clone(), Some(Vec::new()))
+                .unwrap();
+            let (sessions, progress) = catalog(&reader);
+            assert_eq!(sessions.len(), 1);
+            assert!(!sessions[0].available && !sessions[0].indexed);
+            assert_eq!(
+                progress
+                    .iter()
+                    .map(|progress| progress.indexable)
+                    .sum::<usize>(),
+                0
+            );
+            assert_eq!(
+                progress
+                    .iter()
+                    .map(|progress| progress.indexed)
+                    .sum::<usize>(),
+                0
+            );
+            assert_eq!(
+                progress
+                    .iter()
+                    .map(|progress| progress.unreadable)
+                    .sum::<usize>(),
+                1
+            );
+        }
+        reader
+            .search(
+                1,
+                SearchQuery {
+                    text: "needle".into(),
+                    ..Default::default()
+                },
+                SearchCursor::default(),
+                Cancellation::default(),
+            )
+            .unwrap();
+        assert!(hits(&reader, 1).0.is_empty());
+        fixture.close(reader);
+    }
+
+    #[test]
+    fn cancelled_requests_do_not_publish_results_and_completed_snapshot_is_released_on_cancel() {
+        let fixture = Fixture::new(1, false);
+        let reader = Runtime::new(fixture.data.clone());
+        catalog(&reader);
+        let cancelled = Cancellation::default();
+        cancelled.cancel();
+        reader
+            .search(
+                1,
+                SearchQuery {
+                    text: "needle".into(),
+                    ..Default::default()
+                },
+                SearchCursor::default(),
+                cancelled,
+            )
+            .unwrap();
+        let cancel = Cancellation::default();
+        reader
+            .search(
+                2,
+                SearchQuery {
+                    text: "needle".into(),
+                    ..Default::default()
+                },
+                SearchCursor::default(),
+                cancel.clone(),
+            )
+            .unwrap();
+        let mut stale = false;
+        next(&reader, |event| {
+            if matches!(event, Event::Hits { generation: 1, .. }) {
+                stale = true;
+            }
+            matches!(event, Event::Hits { generation: 2, .. })
+        });
+        assert!(!stale);
+        let snapshot_directory = fs::read_dir(&fixture.data)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("snapshots-")
+            })
+            .unwrap();
+        assert!(fs::read_dir(&snapshot_directory).unwrap().next().is_some());
+        cancel.cancel();
+        let start = Instant::now();
+        while fs::read_dir(&snapshot_directory).unwrap().next().is_some() {
+            assert!(
+                start.elapsed() < Duration::from_secs(3),
+                "Cancelled result cache was not released"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        fixture.close(reader);
     }
 }

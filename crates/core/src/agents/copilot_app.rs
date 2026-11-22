@@ -274,6 +274,7 @@ impl AgentAdapter for CopilotApp {
                 first_assistant: MessageTime::Missing,
                 indexed: false,
                 available: false,
+                content_error: Some("Local session transcript was not found".into()),
             }
         };
         let directory = candidate

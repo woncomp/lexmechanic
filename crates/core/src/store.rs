@@ -19,7 +19,7 @@ const SCHEMA_VERSION: i64 = 2;
 const PARSER_VERSION: i64 = 1;
 
 pub struct Store {
-    connection: Connection,
+    pub(crate) connection: Connection,
 }
 
 #[derive(Clone, Debug)]
@@ -122,6 +122,7 @@ impl Store {
             if &previous == session {
                 return Ok(());
             }
+
             let old = &previous.candidate;
             let new = &session.candidate;
             let replacement = old.file_identity.is_some()
@@ -159,6 +160,19 @@ impl Store {
         Ok(())
     }
 
+    pub fn mark_unreadable(&mut self, session: &mut Session, reason: String) -> Result<()> {
+        session.available = false;
+        session.indexed = false;
+        session.content_error = Some(reason);
+        self.upsert_session(session)?;
+        let key = session.candidate.key.storage_key();
+        let tx = self.connection.transaction()?;
+        tx.execute("DELETE FROM messages WHERE session=?1", [&key])?;
+        tx.execute("DELETE FROM checkpoints WHERE session=?1", [&key])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn sessions(&self, mode: TimeMode) -> Result<Vec<Session>> {
         let order = match mode {
             TimeMode::Latest => "latest",
@@ -171,6 +185,70 @@ impl Store {
             .query_map([], |row| row.get::<_, String>(0))?
             .map(|row| Ok(serde_json::from_str(&row?)?))
             .collect()
+    }
+
+    pub fn with_read_snapshot<T>(&self, read: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        self.connection.execute_batch("BEGIN DEFERRED;")?;
+        let result = (|| {
+            self.connection
+                .query_row("SELECT COUNT(*) FROM sessions", [], |row| {
+                    row.get::<_, i64>(0)
+                })?;
+            read(self)
+        })();
+        let closed = self.connection.execute_batch("ROLLBACK;");
+        match result {
+            Ok(value) => {
+                closed?;
+                Ok(value)
+            }
+            Err(error) => {
+                closed.context("Cannot release search snapshot")?;
+                Err(error)
+            }
+        }
+    }
+
+    pub fn copy_session_to(
+        &self,
+        key: &str,
+        target: &mut Store,
+        cancel: &Cancellation,
+    ) -> Result<()> {
+        let session = self.session(key)?.context("Session is no longer indexed")?;
+        anyhow::ensure!(
+            session.available && session.indexed,
+            "Session content is not readable"
+        );
+        target.upsert_session(&session)?;
+        let tx = target.connection.transaction()?;
+        let mut statement = self.connection.prepare(
+            "SELECT id,ordinal,event_id,role,time,body,folded,attachments,start,end
+             FROM messages WHERE session=?1 ORDER BY ordinal",
+        )?;
+        let mut rows = statement.query([key])?;
+        let mut insert = tx.prepare(
+            "INSERT INTO messages(id,session,ordinal,event_id,role,time,body,folded,attachments,start,end)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)")?;
+        while let Some(row) = rows.next()? {
+            cancel.check()?;
+            insert.execute(params![
+                row.get::<_, i64>(0)?,
+                key,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, i64>(9)?
+            ])?;
+        }
+        drop(insert);
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn session(&self, key: &str) -> Result<Option<Session>> {
@@ -332,7 +410,7 @@ impl Store {
                 .transpose()?
                 .unwrap_or(MessageTime::Missing);
         }
-        session.indexed = batch.eof && !batch.incomplete_tail;
+        session.indexed = batch.eof;
         tx.execute(
             "INSERT INTO checkpoints(session,cursor,prefix,boundary,parser) VALUES(?1,?2,?3,?4,?5)
              ON CONFLICT(session) DO UPDATE SET cursor=excluded.cursor,
@@ -446,6 +524,16 @@ impl Store {
         )?)
     }
 
+    pub fn readable_message(&self, key: &str, rowid: i64) -> Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages m JOIN sessions s ON s.id=m.session
+             WHERE m.id=?1 AND m.session=?2 AND json_extract(s.data,'$.available')=1
+             AND json_extract(s.data,'$.indexed')=1)",
+            params![rowid, key],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn original_message(&self, rowid: i64) -> Result<String> {
         let session: String = self.connection.query_row(
             "SELECT session FROM messages WHERE id=?1",
@@ -511,9 +599,11 @@ impl Store {
                 "WITH candidates AS MATERIALIZED (
                  SELECT m.id,m.session,m.ordinal,m.role,{order} AS sorttime {from}
                  WHERE m.session=s.id AND (?1 IS NULL OR s.id=?1)
+                 AND json_extract(s.data,'$.available')=1 AND json_extract(s.data,'$.indexed')=1
                  AND (?2 IS NULL OR m.role=?2)
                  AND (?3 IS NULL OR json_extract(s.data,'$.workspace')=?3)
                  AND (?5 IS NULL OR {order}>=?5)
+                 AND (?10 IS NULL OR s.id IN (SELECT value FROM json_each(?10)))
                  AND (?6=0 OR ({order} IS NULL AND ?7 IS NOT NULL) OR {order}<?7
                      OR ({order} IS ?7 AND (s.id>?8 OR (s.id=?8 AND m.ordinal>=?9))))
                  {matching} ORDER BY {order} DESC,s.id,m.ordinal LIMIT 128)
@@ -534,6 +624,11 @@ impl Store {
                     .as_ref()
                     .map(|position| position.session.as_str()),
                 cursor.after.as_ref().map(|position| position.ordinal),
+                query
+                    .members
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
             ])?;
             let mut page = SearchPage::default();
             let mut last = None;
@@ -578,6 +673,9 @@ impl Store {
                         role: parse_role(&row.get::<_, String>(3)?)?,
                         snippet: snippet(&body, range.start),
                         offset: range.start,
+                        session_name: String::new(),
+                        workspace: None,
+                        document_snapshot: query.session.is_some(),
                     });
                 }
                 if processed_bytes >= 2 * 1024 * 1024 {

@@ -216,6 +216,10 @@ fn incomplete_tail_does_not_advance_cursor_and_completed_append_is_imported_once
         "{{\"type\":\"assistant.message\",\"data\":{{\"content\":\""
     )
     .unwrap();
+    let candidate = fixture
+        .adapter
+        .probe(&candidate, &Cancellation::default())
+        .unwrap();
     let batch = fixture
         .adapter
         .read_batch(&candidate, 0, usize::MAX, &Cancellation::default())
@@ -223,6 +227,10 @@ fn incomplete_tail_does_not_advance_cursor_and_completed_append_is_imported_once
     assert!(batch.incomplete_tail);
     assert_eq!(batch.cursor, complete_length);
     writeln!(file, "completed\"}}}}").unwrap();
+    let candidate = fixture
+        .adapter
+        .probe(&candidate, &Cancellation::default())
+        .unwrap();
     let mut store = Store::open(&fixture.database).unwrap();
     let session = fixture.index(&mut store, &candidate);
     let again = fixture.index(&mut store, &candidate);
@@ -314,6 +322,10 @@ fn index_error_reports_gaps_and_keeps_following_valid_messages() {
     )
     .unwrap();
     writeln!(file, "{}", msg("user.message", "", "after gap")).unwrap();
+    let candidate = fixture
+        .adapter
+        .probe(&candidate, &Cancellation::default())
+        .unwrap();
     let batch = fixture
         .adapter
         .read_batch(&candidate, 0, usize::MAX, &Cancellation::default())

@@ -111,9 +111,25 @@ pub struct Session {
     pub first_assistant: MessageTime,
     pub indexed: bool,
     pub available: bool,
+    #[serde(default)]
+    pub content_error: Option<String>,
 }
 
 impl Session {
+    pub fn unreadable(candidate: Candidate, reason: String) -> Self {
+        Self {
+            name: candidate.key.native.chars().take(8).collect(),
+            candidate,
+            workspace: None,
+            created: MessageTime::Missing,
+            latest: MessageTime::Missing,
+            first_assistant: MessageTime::Missing,
+            indexed: false,
+            available: false,
+            content_error: Some(reason),
+        }
+    }
+
     pub fn time(&self, mode: TimeMode) -> Option<DateTime<Utc>> {
         match mode {
             TimeMode::Latest => self.latest.value().or_else(|| {

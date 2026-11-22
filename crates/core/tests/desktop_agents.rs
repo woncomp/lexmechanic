@@ -752,7 +752,7 @@ fn app_workspace_and_title_changes_are_visible_without_event_log_modification() 
 }
 
 #[test]
-fn cached_cli_classified_app_content_survives_reclassification_when_its_source_log_is_gone() {
+fn unreadable_app_reclassification_keeps_metadata_but_excludes_cached_body_from_index() {
     let fixtures = Fixtures::new();
     let app = CopilotApp::new(&fixtures.copilot).unwrap();
     let cli = CopilotCli::new(&fixtures.copilot).unwrap();
@@ -785,19 +785,17 @@ fn cached_cli_classified_app_content_survives_reclassification_when_its_source_l
     assert!(store.session(&legacy.key.storage_key()).unwrap().is_none());
     let current = store.session(&current_key.storage_key()).unwrap().unwrap();
     assert!(!current.available);
-    assert!(current.indexed);
+    assert!(!current.indexed);
+    assert!(current.content_error.is_some());
     assert_eq!(current.name, "App conversation name");
     assert_eq!(
         store
             .message_infos(&current_key.storage_key())
             .unwrap()
             .len(),
-        2
+        0
     );
-    assert_eq!(
-        store.message(old_rowid).unwrap().content,
-        "User question 中文"
-    );
+    assert!(store.message(old_rowid).is_err());
     assert_eq!(
         store
             .search_page(
@@ -811,6 +809,6 @@ fn cached_cli_classified_app_content_survives_reclassification_when_its_source_l
             .unwrap()
             .hits
             .len(),
-        1
+        0
     );
 }

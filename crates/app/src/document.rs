@@ -31,11 +31,10 @@ pub struct Document {
     pub nav_scroll: UniformListScrollHandle,
     pub current: usize,
     pub complete: bool,
-    pub follow: bool,
     pub loading: bool,
     pub tick: u64,
     pub reveal: Option<(i64, usize, usize)>,
-    pub outdated: bool,
+    pub error: Option<String>,
 }
 
 impl Document {
@@ -51,11 +50,10 @@ impl Document {
             nav_scroll: UniformListScrollHandle::new(),
             current: 0,
             complete: false,
-            follow: false,
             loading: true,
             tick: 0,
             reveal: None,
-            outdated: false,
+            error: None,
         }
     }
 

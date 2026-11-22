@@ -118,7 +118,6 @@ dependencies = [
  "chrono",
  "directories",
  "gpui-kit",
- "notify",
  "rusqlite",
  "serde",
  "serde_json",

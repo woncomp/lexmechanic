@@ -16,13 +16,22 @@ pub enum ScanEvent {
     Diagnostic(Diagnostic),
     Progress {
         source: String,
-        discovered: usize,
-        scanned: usize,
-        indexed: usize,
+        progress: ScanProgress,
     },
     Finished {
         source: String,
+        error: Option<String>,
     },
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ScanProgress {
+    pub discovered: usize,
+    pub scanned: usize,
+    pub indexable: usize,
+    pub indexed: usize,
+    pub unreadable: usize,
+    pub failed: usize,
 }
 
 pub struct ScanHandle {
@@ -71,7 +80,10 @@ pub fn start_with_writer(
                 .name(format!("scan-{}", adapter.source().agent))
                 .spawn(move || {
                     let source = adapter.source().id.clone();
-                    if let Err(error) = scan_source(adapter.as_ref(), writer, &cancel, &sender)
+                    let error = scan_source(adapter.as_ref(), writer, &cancel, &sender)
+                        .err()
+                        .map(|error| format!("{error:#}"));
+                    if let Some(error) = &error
                         && !cancel.is_cancelled()
                     {
                         let _ = send(
@@ -79,12 +91,12 @@ pub fn start_with_writer(
                             ScanEvent::Diagnostic(Diagnostic {
                                 path: adapter.source().root.clone(),
                                 offset: None,
-                                description: format!("{error:#}"),
+                                description: error.clone(),
                             }),
                             &cancel,
                         );
                     }
-                    let _ = send(&sender, ScanEvent::Finished { source }, &cancel);
+                    let _ = send(&sender, ScanEvent::Finished { source, error }, &cancel);
                 })?,
         );
     }
@@ -131,7 +143,10 @@ fn scan_source(
         }
     }
     candidates.sort_unstable_by(|a, b| b.modified_ns.cmp(&a.modified_ns).then(a.key.cmp(&b.key)));
-    let discovered = candidates.len();
+    let mut progress = ScanProgress {
+        discovered: candidates.len(),
+        ..Default::default()
+    };
     let present: HashSet<_> = candidates
         .iter()
         .map(|candidate| candidate.key.storage_key())
@@ -143,7 +158,6 @@ fn scan_source(
     for mut session in cached {
         if session.candidate.key.source == adapter.source().id
             && session.candidate.key.agent == adapter.source().agent
-            && session.available
             && !present.contains(&session.candidate.key.storage_key())
         {
             let mut store = writer
@@ -156,14 +170,26 @@ fn scan_source(
                 continue;
             }
             session.available = false;
-            store.upsert_session(&session)?;
+            store.mark_unreadable(
+                &mut session,
+                "Session transcript is no longer present in this source".into(),
+            )?;
             drop(store);
             send(sender, ScanEvent::Session(Box::new(session)), cancel)?;
+            progress.discovered += 1;
+            progress.scanned += 1;
+            progress.unreadable += 1;
         }
     }
+    send(
+        sender,
+        ScanEvent::Progress {
+            source: adapter.source().id.clone(),
+            progress: progress.clone(),
+        },
+        cancel,
+    )?;
     let mut queue = VecDeque::new();
-    let mut scanned = 0;
-    let mut indexed = 0;
     for candidate in candidates {
         cancel.check()?;
         match adapter.summarize(&candidate, cancel) {
@@ -173,23 +199,20 @@ fn scan_source(
                     .map_err(|_| anyhow::anyhow!("Index writer failed"))?;
                 let previous = store.session(&candidate.key.storage_key())?;
                 if !session.available {
-                    if let Some(mut cached) = previous.filter(|session| session.indexed) {
-                        cached.name = session.name;
-                        cached.workspace = session.workspace;
-                        cached.available = false;
-                        session = cached;
-                    }
-                    store.upsert_session(&session)?;
+                    let reason = session
+                        .content_error
+                        .clone()
+                        .unwrap_or_else(|| "Local session transcript is unavailable".into());
+                    store.mark_unreadable(&mut session, reason)?;
                     drop(store);
                     send(sender, ScanEvent::Session(Box::new(session)), cancel)?;
-                    scanned += 1;
+                    progress.scanned += 1;
+                    progress.unreadable += 1;
                     send(
                         sender,
                         ScanEvent::Progress {
                             source: adapter.source().id.clone(),
-                            discovered,
-                            scanned,
-                            indexed,
+                            progress: progress.clone(),
                         },
                         cancel,
                     )?;
@@ -207,7 +230,8 @@ fn scan_source(
                     store.upsert_session(&previous)?;
                     drop(store);
                     send(sender, ScanEvent::Session(Box::new(previous)), cancel)?;
-                    indexed += 1;
+                    progress.indexable += 1;
+                    progress.indexed += 1;
                 } else {
                     store.upsert_session(&session)?;
                     let cursor = store.resume_cursor(&session)?;
@@ -219,26 +243,39 @@ fn scan_source(
                         cancel,
                     )?;
                     queue.push_back((session, cursor, 0_u64));
+                    progress.indexable += 1;
                 }
             }
-            Err(error) => send(
-                sender,
-                ScanEvent::Diagnostic(Diagnostic {
-                    path: candidate.events_path,
-                    offset: None,
-                    description: format!("{error:#}"),
-                }),
-                cancel,
-            )?,
+            Err(error) => {
+                let reason = format!("{error:#}");
+                let mut store = writer
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Index writer failed"))?;
+                let mut session = store
+                    .session(&candidate.key.storage_key())?
+                    .unwrap_or_else(|| Session::unreadable(candidate.clone(), reason.clone()));
+                session.candidate = candidate;
+                store.mark_unreadable(&mut session, reason.clone())?;
+                drop(store);
+                send(
+                    sender,
+                    ScanEvent::Diagnostic(Diagnostic {
+                        path: session.candidate.events_path.clone(),
+                        offset: None,
+                        description: reason,
+                    }),
+                    cancel,
+                )?;
+                send(sender, ScanEvent::Session(Box::new(session)), cancel)?;
+                progress.failed += 1;
+            }
         }
-        scanned += 1;
+        progress.scanned += 1;
         send(
             sender,
             ScanEvent::Progress {
                 source: adapter.source().id.clone(),
-                discovered,
-                scanned,
-                indexed,
+                progress: progress.clone(),
             },
             cancel,
         )?;
@@ -249,28 +286,47 @@ fn scan_source(
     // Summaries never wait for historical body indexing; large files yield between batches.
     while let Some((mut session, cursor, burst_bytes)) = queue.pop_front() {
         cancel.check()?;
-        let batch = match adapter.read_batch(&session.candidate, cursor, 256 * 1024, cancel) {
+        let read = (|| -> Result<ReadBatch> {
+            let batch = adapter.read_batch(&session.candidate, cursor, 256 * 1024, cancel)?;
+            let mut store = writer
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Index writer failed"))?;
+            cancel.check()?;
+            store.commit_batch(&mut session, &batch)?;
+            Ok(batch)
+        })();
+        let batch = match read {
             Ok(batch) => batch,
             Err(error) => {
+                cancel.check()?;
+                let reason = format!("{error:#}");
+                writer
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Index writer failed"))?
+                    .mark_unreadable(&mut session, reason.clone())?;
                 send(
                     sender,
                     ScanEvent::Diagnostic(Diagnostic {
                         path: session.candidate.events_path.clone(),
                         offset: Some(cursor),
-                        description: format!("{error:#}"),
+                        description: reason,
                     }),
+                    cancel,
+                )?;
+                progress.indexable = progress.indexable.saturating_sub(1);
+                progress.failed += 1;
+                send(sender, ScanEvent::Session(Box::new(session)), cancel)?;
+                send(
+                    sender,
+                    ScanEvent::Progress {
+                        source: adapter.source().id.clone(),
+                        progress: progress.clone(),
+                    },
                     cancel,
                 )?;
                 continue;
             }
         };
-        {
-            let mut writer = writer
-                .lock()
-                .map_err(|_| anyhow::anyhow!("Index writer failed"))?;
-            cancel.check()?;
-            writer.commit_batch(&mut session, &batch)?;
-        }
         for diagnostic in &batch.diagnostics {
             send(sender, ScanEvent::Diagnostic(diagnostic.clone()), cancel)?;
         }
@@ -280,14 +336,14 @@ fn scan_source(
             cancel,
         )?;
         if batch.eof {
-            indexed += usize::from(!batch.incomplete_tail);
+            progress.indexed += 1;
             if batch.incomplete_tail {
                 send(
                     sender,
                     ScanEvent::Diagnostic(Diagnostic {
                         path: session.candidate.events_path.clone(),
                         offset: Some(batch.cursor),
-                        description: "Incomplete trailing event; waiting for the writer to finish"
+                        description: "Incomplete trailing event excluded from this snapshot; refresh to retry"
                             .into(),
                     }),
                     cancel,
@@ -306,12 +362,74 @@ fn scan_source(
             sender,
             ScanEvent::Progress {
                 source: adapter.source().id.clone(),
-                discovered,
-                scanned,
-                indexed,
+                progress: progress.clone(),
             },
             cancel,
         )?;
     }
     Ok(())
+}
+
+/// Rechecks a known member without enumerating its source or changing list membership.
+pub fn prepare_known(
+    store: &mut Store,
+    known: &Session,
+    cancel: &Cancellation,
+) -> Result<(Session, Vec<Diagnostic>)> {
+    cancel.check()?;
+    let mut session = known.clone();
+    let result = (|| -> Result<Vec<Diagnostic>> {
+        let adapter = crate::agents::adapter_for(&known.candidate)?;
+        session.candidate = adapter.probe(&known.candidate, cancel)?;
+        session.available = true;
+        session.content_error = None;
+        if let Some(cached) = store.session(&session.candidate.key.storage_key())?
+            && cached.candidate == session.candidate
+            && cached.available
+            && cached.indexed
+        {
+            session = cached;
+            return Ok(Vec::new());
+        }
+        session.indexed = false;
+        store.upsert_session(&session)?;
+        let mut cursor = store.resume_cursor(&session)?;
+        let mut diagnostics = Vec::new();
+        loop {
+            cancel.check()?;
+            let batch = adapter.read_batch(&session.candidate, cursor, 256 * 1024, cancel)?;
+            store.commit_batch(&mut session, &batch)?;
+            diagnostics.extend(batch.diagnostics);
+            cursor = batch.cursor;
+            if batch.eof {
+                if batch.incomplete_tail {
+                    diagnostics.push(Diagnostic {
+                        path: session.candidate.events_path.clone(),
+                        offset: Some(cursor),
+                        description:
+                            "Incomplete trailing event excluded from this snapshot; reload to retry"
+                                .into(),
+                    });
+                }
+                break;
+            }
+        }
+        Ok(diagnostics)
+    })();
+    match result {
+        Ok(diagnostics) => Ok((session, diagnostics)),
+        Err(error) => {
+            cancel.check()?;
+            let reason = format!("{error:#}");
+            store.mark_unreadable(&mut session, reason.clone())?;
+            Ok((
+                session,
+                vec![Diagnostic {
+                    path: known.candidate.events_path.clone(),
+                    offset: None,
+                    description: reason,
+                }],
+            ))
+        }
+    }
 }

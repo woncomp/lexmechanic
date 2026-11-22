@@ -6,7 +6,7 @@ use serde_json::{Map, Value};
 use std::{
     collections::HashMap,
     fs::{self, File},
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -83,7 +83,7 @@ impl VsCode {
         {
             return Ok(transcript.clone());
         }
-        let transcript = Arc::new(replay(&candidate.events_path, cancel)?);
+        let transcript = Arc::new(replay(&candidate.events_path, candidate.size, cancel)?);
         *self
             .replay
             .lock()
@@ -280,6 +280,7 @@ impl AgentAdapter for VsCode {
                 .unwrap_or(MessageTime::Missing),
             indexed: false,
             available: true,
+            content_error: None,
         })
     }
 
@@ -309,7 +310,11 @@ impl AgentAdapter for VsCode {
     }
 
     fn original_message(&self, candidate: &Candidate, cached: &Message) -> Result<String> {
-        let transcript = replay(&candidate.events_path, &Cancellation::default())?;
+        let transcript = replay(
+            &candidate.events_path,
+            candidate.size,
+            &Cancellation::default(),
+        )?;
         let current = messages(&transcript.state, &Cancellation::default())?
             .into_iter()
             .find(|message| message.id == cached.id)
@@ -428,11 +433,14 @@ fn messages(state: &Value, cancel: &Cancellation) -> Result<Vec<Message>> {
     Ok(messages)
 }
 
-fn replay(path: &Path, cancel: &Cancellation) -> Result<Transcript> {
-    let mut reader = BufReader::new(
-        File::open(path)
-            .with_context(|| format!("Cannot read VS Code transcript {}", path.display()))?,
+fn replay(path: &Path, limit: u64, cancel: &Cancellation) -> Result<Transcript> {
+    let file = File::open(path)
+        .with_context(|| format!("Cannot read VS Code transcript {}", path.display()))?;
+    anyhow::ensure!(
+        file.metadata()?.len() >= limit,
+        "VS Code transcript was truncated; refresh to retry"
     );
+    let mut reader = BufReader::new(file.take(limit));
     let mut state = Value::Null;
     let mut line = Vec::new();
     let mut cursor = 0;

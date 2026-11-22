@@ -336,8 +336,9 @@ pub(super) fn summarize_log(
         first_assistant: MessageTime::Pending,
         indexed: false,
         available: true,
+        content_error: None,
     };
-    let mut reader = BufReader::new(File::open(&candidate.events_path)?);
+    let mut reader = BufReader::new(File::open(&candidate.events_path)?.take(candidate.size));
     let mut line = Vec::new();
     let mut offset = 0;
     loop {
@@ -397,7 +398,7 @@ pub(super) fn summarize_log(
     if summary.name.is_empty() {
         summary.name = candidate.key.native.chars().take(8).collect();
     }
-    summary.latest = tail_time(&candidate.events_path, PROBE_BYTES, cancel)?;
+    summary.latest = tail_time(&candidate.events_path, candidate.size, PROBE_BYTES, cancel)?;
     Ok(summary)
 }
 
@@ -408,8 +409,12 @@ pub(super) fn read_log(
     cancel: &Cancellation,
 ) -> Result<ReadBatch> {
     let mut file = File::open(&candidate.events_path)?;
+    anyhow::ensure!(
+        file.metadata()?.len() >= candidate.size && cursor <= candidate.size,
+        "Transcript was truncated during this operation; refresh to retry"
+    );
     file.seek(SeekFrom::Start(cursor))?;
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::new(file.take(candidate.size - cursor));
     let mut batch = ReadBatch {
         messages: Vec::new(),
         cursor,
@@ -466,9 +471,13 @@ pub(super) fn read_log(
     Ok(batch)
 }
 
-fn tail_time(path: &Path, budget: usize, cancel: &Cancellation) -> Result<MessageTime> {
+fn tail_time(path: &Path, limit: u64, budget: usize, cancel: &Cancellation) -> Result<MessageTime> {
     let mut file = File::open(path)?;
-    let mut position = file.metadata()?.len();
+    anyhow::ensure!(
+        file.metadata()?.len() >= limit,
+        "Transcript was truncated during summary reading"
+    );
+    let mut position = limit;
     let mut remainder = Vec::new();
     let mut bytes = 0;
     while position > 0 && bytes < budget {

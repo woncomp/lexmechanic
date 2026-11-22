@@ -402,6 +402,7 @@ mod tests {
             first_assistant: MessageTime::parse(Some(first)),
             indexed: false,
             available: true,
+            content_error: None,
         }
     }
 

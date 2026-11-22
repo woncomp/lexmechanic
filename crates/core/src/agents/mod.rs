@@ -104,6 +104,15 @@ pub(super) fn open_read_only(path: &Path) -> Result<Connection> {
 /// Adapters are synchronous; the scheduler owns their worker threads.
 pub trait AgentAdapter: Send + Sync + 'static {
     fn source(&self) -> &Source;
+    fn probe(&self, previous: &Candidate, cancel: &Cancellation) -> Result<Candidate> {
+        cancel.check()?;
+        candidate(
+            self.source(),
+            previous.key.native.clone(),
+            &previous.events_path,
+            previous.read_mode,
+        )
+    }
     fn discover(&self, cancel: &Cancellation) -> anyhow::Result<Discovery>;
     fn summarize(&self, candidate: &Candidate, cancel: &Cancellation) -> anyhow::Result<Session>;
     fn read_batch(

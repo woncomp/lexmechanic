@@ -64,6 +64,7 @@ pub struct SearchQuery {
     pub session: Option<String>,
     pub mode: TimeMode,
     pub since: Option<chrono::DateTime<chrono::Utc>>,
+    pub members: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -74,6 +75,12 @@ pub struct SearchHit {
     pub role: Role,
     pub snippet: String,
     pub offset: usize,
+    #[serde(default)]
+    pub session_name: String,
+    #[serde(default)]
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub document_snapshot: bool,
 }
 
 #[derive(Clone, Debug, Default)]

@@ -7,7 +7,7 @@ use crate::{
 };
 use agent_chat_reader_core::{
     model::{Cancellation, Role, Session, TimeMode},
-    scan::ScanEvent,
+    scan::{ScanEvent, ScanProgress},
     search::{SearchCursor, SearchHit, SearchQuery},
 };
 use gpui_kit::{
@@ -86,6 +86,7 @@ pub struct Workbench {
     jump_input: Entity<InputState>,
     focus: FocusHandle,
     doc_focus: FocusHandle,
+    focus_document: bool,
     generation: u64,
     doc_cancel: Cancellation,
     query_generation: u64,
@@ -104,7 +105,10 @@ pub struct Workbench {
     show_diagnostics: bool,
     diagnostics: Vec<String>,
     status: String,
-    progress: HashMap<String, (usize, usize, usize)>,
+    progress: HashMap<String, ScanProgress>,
+    catalog_run: u64,
+    search_state: String,
+    active_query: Option<SearchQuery>,
     finished: HashSet<String>,
     reclassified: HashSet<String>,
     save_due: Option<Instant>,
@@ -182,7 +186,7 @@ impl Workbench {
         }));
         subscriptions.push(
             cx.subscribe_in(&search_input, window, |this, _, event, _, cx| {
-                if matches!(event, InputEvent::Change) {
+                if matches!(event, InputEvent::Change | InputEvent::PressEnter { .. }) {
                     this.query_local = false;
                     this.queue_search(cx);
                 }
@@ -304,6 +308,7 @@ impl Workbench {
             jump_input,
             focus,
             doc_focus: cx.focus_handle(),
+            focus_document: false,
             generation: 0,
             doc_cancel: Cancellation::default(),
             query_generation: 0,
@@ -323,6 +328,9 @@ impl Workbench {
             diagnostics: Vec::new(),
             status: "Discovering Copilot CLI, Copilot App and VS Code sessions…".into(),
             progress: HashMap::new(),
+            catalog_run: 0,
+            search_state: String::new(),
+            active_query: None,
             finished: HashSet::new(),
             reclassified: HashSet::new(),
             save_due: None,
@@ -402,7 +410,17 @@ impl Workbench {
                     changed.extend(sessions.into_iter().map(Arc::new));
                 }
                 Event::Cached(sessions) => changed.extend(sessions.into_iter().map(Arc::new)),
-                Event::Scan(ScanEvent::Reclassified(replacement)) => {
+                Event::CatalogStarted { run_id } => {
+                    if run_id >= self.catalog_run {
+                        self.catalog_run = run_id;
+                        self.progress.clear();
+                        self.finished.clear();
+                    }
+                }
+                Event::Scan {
+                    run_id,
+                    event: ScanEvent::Reclassified(replacement),
+                } if run_id == self.catalog_run => {
                     let old = replacement.previous.storage_key();
                     let new = replacement.current.storage_key();
                     self.save_position();
@@ -442,40 +460,22 @@ impl Workbench {
                     });
                     self.save_due = Some(Instant::now() + Duration::from_secs(1));
                 }
-                Event::Scan(ScanEvent::Session(session)) => {
+                Event::Scan {
+                    run_id,
+                    event: ScanEvent::Session(session),
+                } if run_id == self.catalog_run => {
                     if self
                         .reclassified
                         .contains(&session.candidate.key.storage_key())
                     {
                         continue;
                     }
-                    if let Some(document) = &mut self.document
-                        && document.key == session.candidate.key.storage_key()
-                    {
-                        let previous = self.sessions.get(&document.key);
-                        if previous.is_some_and(|previous| {
-                            previous.candidate.modified_ns != session.candidate.modified_ns
-                                || previous.candidate.size != session.candidate.size
-                        }) {
-                            document.outdated = true;
-                        }
-                        if document.follow && document.outdated && session.indexed {
-                            self.doc_cancel.cancel();
-                            self.doc_cancel = Cancellation::default();
-                            self.generation += 1;
-                            document.chunks.clear();
-                            document.pending.clear();
-                            let result = self.runtime.open(
-                                self.generation,
-                                (*session).clone(),
-                                self.doc_cancel.clone(),
-                            );
-                            self.report(result);
-                        }
-                    }
                     changed.push(Arc::new(*session));
                 }
-                Event::Scan(ScanEvent::Diagnostic(diagnostic)) => self.error(format!(
+                Event::Scan {
+                    run_id,
+                    event: ScanEvent::Diagnostic(diagnostic),
+                } if run_id == self.catalog_run => self.error(format!(
                     "{}{}: {}",
                     diagnostic.path.display(),
                     diagnostic
@@ -484,16 +484,19 @@ impl Workbench {
                         .unwrap_or_default(),
                     diagnostic.description
                 )),
-                Event::Scan(ScanEvent::Progress {
-                    source,
-                    discovered,
-                    scanned,
-                    indexed,
-                }) => {
-                    self.progress.insert(source, (discovered, scanned, indexed));
+                Event::Scan {
+                    run_id,
+                    event: ScanEvent::Progress { source, progress },
+                } if run_id == self.catalog_run => {
+                    self.progress.insert(source, progress);
                 }
-                Event::Scan(ScanEvent::Finished { source }) => {
+                Event::Scan {
+                    run_id,
+                    event: ScanEvent::Finished { source, .. },
+                } if run_id == self.catalog_run => {
                     self.finished.insert(source);
+                }
+                Event::CatalogFinished { run_id } if run_id == self.catalog_run => {
                     self.status = if self.diagnostics.is_empty() {
                         "Ready · local main conversations · newest modified sessions scanned first"
                             .into()
@@ -503,9 +506,28 @@ impl Workbench {
                             self.diagnostics.len()
                         )
                     };
-                    if (self.search_mode || self.find_visible) && !self.query_text.is_empty() {
-                        self.queue_search(cx);
-                    }
+                }
+                Event::SearchState {
+                    generation,
+                    message,
+                } if generation == self.query_generation => {
+                    self.search_state = message;
+                }
+                Event::SearchFailed {
+                    generation,
+                    message,
+                } if generation == self.query_generation => {
+                    self.hits_complete = true;
+                    self.search_state = format!("搜索失败：{message}");
+                    self.error(message);
+                }
+                Event::OpenHit {
+                    generation,
+                    hit,
+                    permanent,
+                } if generation == self.query_generation => {
+                    self.focus_document = permanent;
+                    self.open_verified_hit(hit, permanent, cx);
                 }
                 Event::Document {
                     generation,
@@ -527,7 +549,6 @@ impl Workbench {
                         });
                     document.messages = messages;
                     document.complete = complete;
-                    document.outdated = false;
                     document.loading = false;
                     if was_loading && let Some(position) = self.settings.positions.get(&key) {
                         document.collapsed = position.collapsed.iter().cloned().collect();
@@ -573,9 +594,6 @@ impl Workbench {
                             });
                         }
                     }
-                    if document.follow {
-                        document.jump(document.messages.len().saturating_sub(1));
-                    }
                     if let Some((rowid, ordinal, offset)) = self.jump_pending.take()
                         && !Self::jump_to_match(&mut document, rowid, ordinal, offset)
                     {
@@ -605,6 +623,7 @@ impl Workbench {
                 } if generation == self.generation => {
                     if let Some(document) = &mut self.document {
                         document.loading = false;
+                        document.error = Some(message.clone());
                     }
                     self.error(message);
                 }
@@ -671,9 +690,10 @@ impl Workbench {
                     more,
                 } if generation == self.query_generation => {
                     self.hits.extend(hits);
-                    self.hits_scanned += scanned;
+                    self.hits_scanned = scanned;
                     self.hits_complete = complete;
                     self.more_hits = more;
+                    self.search_state.clear();
                 }
                 Event::Copied(text) => {
                     cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -766,9 +786,6 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !session.available {
-            self.status = "Source unavailable · displaying the last indexed conversation".into();
-        }
         self.start_open(session, permanent, cx);
         if permanent {
             self.doc_focus.focus(window, cx);
@@ -778,6 +795,10 @@ impl Workbench {
     fn start_open(&mut self, session: Arc<Session>, permanent: bool, cx: &mut Context<Self>) {
         let key = session.candidate.key.storage_key();
         self.tabs.open(key.clone(), session.name.clone(), permanent);
+        self.report(
+            self.runtime
+                .retain_documents(self.tabs.items.iter().map(|tab| tab.key.clone()).collect()),
+        );
         self.save_due = Some(Instant::now() + Duration::from_secs(1));
         self.load_document(session, cx);
     }
@@ -808,6 +829,30 @@ impl Workbench {
         cx.notify();
     }
 
+    fn reload_document(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self
+            .tabs
+            .active
+            .as_ref()
+            .and_then(|key| self.sessions.get(key))
+            .cloned()
+        else {
+            return;
+        };
+        self.save_position();
+        self.doc_cancel.cancel();
+        self.doc_cancel = Cancellation::default();
+        self.generation += 1;
+        self.document = Some(Document::new(session.candidate.key.storage_key()));
+        self.raw_view = None;
+        self.report(self.runtime.reload(
+            self.generation,
+            (*session).clone(),
+            self.doc_cancel.clone(),
+        ));
+        cx.notify();
+    }
+
     fn activate(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(session) = self.sessions.get(key).cloned() {
             let permanent = self
@@ -822,8 +867,6 @@ impl Workbench {
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        self.progress.clear();
-        self.finished.clear();
         self.report(self.runtime.refresh(
             self.settings.sources.clone(),
             self.settings.vscode_sources.clone(),
@@ -870,6 +913,7 @@ impl Workbench {
         self.hits_complete = false;
         self.more_hits = None;
         self.hit_index = usize::MAX;
+        self.search_state = "准备搜索…".into();
         cx.notify();
     }
 
@@ -891,6 +935,17 @@ impl Workbench {
     }
 
     fn send_search(&mut self, cursor: SearchCursor) {
+        if cursor.offset > 0 {
+            if let Some(query) = self.active_query.clone() {
+                self.report(self.runtime.search(
+                    self.query_generation,
+                    query,
+                    cursor,
+                    self.query_cancel.clone(),
+                ));
+            }
+            return;
+        }
         let workspace = if self.workspace_scope && !self.query_local {
             self.tabs
                 .active
@@ -906,24 +961,27 @@ impl Workbench {
             self.date_filter
                 .map(|days| chrono::Utc::now() - chrono::Duration::days(days))
         };
+        let query = SearchQuery {
+            text: self.query_text.clone(),
+            mode: self.settings.mode,
+            workspace,
+            since,
+            role: if self.query_local {
+                None
+            } else {
+                self.role_filter
+            },
+            session: if self.query_local {
+                self.tabs.active.clone()
+            } else {
+                None
+            },
+            members: None,
+        };
+        self.active_query = Some(query.clone());
         self.report(self.runtime.search(
             self.query_generation,
-            SearchQuery {
-                text: self.query_text.clone(),
-                mode: self.settings.mode,
-                workspace,
-                since,
-                role: if self.query_local {
-                    None
-                } else {
-                    self.role_filter
-                },
-                session: if self.query_local {
-                    self.tabs.active.clone()
-                } else {
-                    None
-                },
-            },
+            query,
             cursor,
             self.query_cancel.clone(),
         ));
@@ -1029,23 +1087,23 @@ impl Workbench {
         &mut self,
         hit: SearchHit,
         permanent: bool,
-        window: &mut Window,
+        _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.report(
+            self.runtime
+                .validate_hit(self.query_generation, hit, permanent),
+        );
+        cx.notify();
+    }
+
+    fn open_verified_hit(&mut self, hit: SearchHit, permanent: bool, cx: &mut Context<Self>) {
         if let Some(session) = self.sessions.get(&hit.session).cloned() {
-            if self
-                .document
-                .as_ref()
-                .is_some_and(|document| document.outdated)
-            {
-                self.save_position();
-                self.document = None;
-            }
-            self.open_session(session, permanent, window, cx);
+            self.start_open(session, permanent, cx);
             if let Some(document) = &mut self.document {
                 if !document.loading {
                     if !Self::jump_to_match(document, hit.message_id, hit.ordinal, hit.offset) {
-                        self.status = "Search result changed; run the search again".into();
+                        self.status = "命中属于不同的文档版本，请 Reload 或重新搜索。".into();
                     }
                 } else {
                     self.jump_pending = Some((hit.message_id, hit.ordinal, hit.offset));
@@ -1057,6 +1115,10 @@ impl Workbench {
     fn close(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.save_position();
         self.tabs.close(key);
+        self.report(
+            self.runtime
+                .retain_documents(self.tabs.items.iter().map(|tab| tab.key.clone()).collect()),
+        );
         if let Some(key) = self.tabs.active.clone() {
             self.activate(&key, window, cx);
         } else {
@@ -1472,6 +1534,32 @@ impl Workbench {
                 .child("Opening conversation…")
                 .into_any_element();
         }
+        if let Some(reason) = &document.error {
+            return v_flex()
+                .id("unreadable-session")
+                .role(gpui_kit::Role::Group)
+                .aria_label("无法读取 session 内容")
+                .aria_description(reason.clone())
+                .size_full()
+                .p_8()
+                .gap_4()
+                .child(div().text_xl().child("无法读取 session 内容"))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(reason.clone()),
+                )
+                .child(div().text_sm().child(
+                    "会话元数据仍保留在列表中。可手动 Reload 重试，或 Refresh 更新会话列表。",
+                ))
+                .child(
+                    Button::new("retry-unreadable")
+                        .label("Reload")
+                        .on_click(cx.listener(|this, _, _, cx| this.reload_document(cx))),
+                )
+                .into_any_element();
+        }
         let list_state = document.list.clone();
         let message_count = document.messages.len();
         let nav_scroll = document.nav_scroll.clone();
@@ -1494,7 +1582,12 @@ impl Workbench {
                             .map(|message| message.info.role)
                             .unwrap_or(Role::Assistant);
                         let hit = this.hits.iter().any(|hit| {
-                            hit.ordinal == index && Some(&hit.session) == this.tabs.active.as_ref()
+                            Some(&hit.session) == this.tabs.active.as_ref()
+                                && this
+                                    .document
+                                    .as_ref()
+                                    .and_then(|document| document.messages.get(index))
+                                    .is_some_and(|message| message.info.rowid == hit.message_id)
                         });
                         div()
                             .id(("nav-message", index))
@@ -1642,18 +1735,7 @@ impl Workbench {
                 h_flex()
                     .flex_1()
                     .min_h_0()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .on_scroll(cx.listener(|this, _, _, _| {
-                                if let Some(document) = &mut this.document {
-                                    document.follow = false;
-                                }
-                            }))
-                            .child(body),
-                    )
+                    .child(div().flex_1().min_w_0().h_full().child(body))
                     .child(
                         div()
                             .h_full()
@@ -1677,38 +1759,8 @@ impl Workbench {
                     .child(div().flex_1())
                     .child(
                         Button::new("reload-document")
-                            .label(if self.document.as_ref().is_some_and(|doc| doc.outdated) {
-                                "New content · Reload"
-                            } else {
-                                "Reload"
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                let key = this.tabs.active.clone();
-                                if let Some(session) =
-                                    key.and_then(|key| this.sessions.get(&key)).cloned()
-                                {
-                                    this.save_position();
-                                    this.document = None;
-                                    this.start_open(session, false, cx);
-                                }
-                            })),
-                    )
-                    .child(
-                        Button::new("follow")
-                            .label(if self.document.as_ref().is_some_and(|doc| doc.follow) {
-                                "Following"
-                            } else {
-                                "Follow"
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(document) = &mut this.document {
-                                    document.follow = !document.follow;
-                                    if document.follow {
-                                        document.jump(document.messages.len().saturating_sub(1));
-                                    }
-                                }
-                                cx.notify();
-                            })),
+                            .label("Reload")
+                            .on_click(cx.listener(|this, _, _, cx| this.reload_document(cx))),
                     )
                     .child(div().w(px(100.)).child(Input::new(&self.jump_input)))
                     .child(Button::new("top").label("Top").on_click(cx.listener(
@@ -1838,9 +1890,11 @@ impl Workbench {
                     .px_3()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(
-                        "Searching indexed main conversations; results may still be incomplete.",
-                    ),
+                    .child(if self.search_state.is_empty() {
+                        "搜索结果已固定；按 Enter 重新检查已有会话并搜索。".to_owned()
+                    } else {
+                        self.search_state.clone()
+                    }),
             )
             .child(
                 uniform_list(
@@ -1851,9 +1905,13 @@ impl Workbench {
                             .map(|index| {
                                 let hit = this.hits[index].clone();
                                 let session = this.sessions.get(&hit.session);
-                                let title = session
-                                    .map(|session| session.name.clone())
-                                    .unwrap_or_else(|| "Session".into());
+                                let title = if hit.session_name.is_empty() {
+                                    session
+                                        .map(|session| session.name.clone())
+                                        .unwrap_or_else(|| "Session".into())
+                                } else {
+                                    hit.session_name.clone()
+                                };
                                 let detail = hit.snippet.clone();
                                 v_flex()
                                     .id(("search-hit", index))
@@ -2018,7 +2076,11 @@ impl Workbench {
 }
 
 impl Render for Workbench {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.focus_document {
+            self.focus_document = false;
+            self.doc_focus.focus(window, cx);
+        }
         let tabs: Vec<_> = self
             .tabs
             .items
@@ -2183,17 +2245,25 @@ impl Render for Workbench {
                 )
                 .into_any_element()
         };
-        let totals = self.progress.values().fold((0, 0, 0), |sum, next| {
-            (sum.0 + next.0, sum.1 + next.1, sum.2 + next.2)
-        });
-        let index_status = if totals.0 > 0 {
+        let mut totals = ScanProgress::default();
+        for progress in self.progress.values() {
+            totals.discovered += progress.discovered;
+            totals.scanned += progress.scanned;
+            totals.indexable += progress.indexable;
+            totals.indexed += progress.indexed;
+            totals.unreadable += progress.unreadable;
+            totals.failed += progress.failed;
+        }
+        let index_status = if totals.discovered > 0 {
             format!(
-                "{} sessions · scanned {}/{} · indexed {}/{}",
+                "{} sessions · scanned {}/{} · indexed {}/{} · unreadable {} · failed {}",
                 self.sessions.len(),
-                totals.1,
-                totals.0,
-                totals.2,
-                totals.0
+                totals.scanned,
+                totals.discovered,
+                totals.indexed,
+                totals.indexable,
+                totals.unreadable,
+                totals.failed,
             )
         } else {
             format!("{} sessions", self.sessions.len())
@@ -2456,7 +2526,13 @@ impl Render for Workbench {
                     .border_t_1()
                     .border_color(cx.theme().border)
                     .text_xs()
-                    .child(index_status)
+                    .child(
+                        div()
+                            .id("index-progress")
+                            .role(gpui_kit::Role::Status)
+                            .aria_label(index_status.clone())
+                            .child(index_status),
+                    )
                     .child(
                         div()
                             .flex_1()
