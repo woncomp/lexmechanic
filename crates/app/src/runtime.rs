@@ -1192,6 +1192,52 @@ mod tests {
             matches!(next_matching(&runtime,|event| matches!(event,Event::Copied(_))),
             Event::Copied(text) if text=="Updated Code response 中文")
         );
+        fs::write(
+            events.with_file_name("workspace.yaml"),
+            "client_name: github/autopilot\nlast_client_name: github/cli\nname: Continued in CLI\n",
+        )
+        .unwrap();
+        let event = next_matching(&runtime, |event| {
+            matches!(event,
+            Event::Scan(ScanEvent::Session(session)) if session.indexed
+                && session.candidate.key.agent == "copilot-cli"
+                && session.candidate.key.native == native)
+        });
+        let Event::Scan(ScanEvent::Session(continued)) = event else {
+            unreachable!()
+        };
+        assert_eq!(continued.name, "Continued in CLI");
+        let store = Store::open(&data.path().join("index.sqlite")).unwrap();
+        assert!(
+            store
+                .session(&providers["copilot-app"].candidate.key.storage_key())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .sessions(TimeMode::Latest)
+                .unwrap()
+                .iter()
+                .filter(|session| session.candidate.key.native == native)
+                .count(),
+            1
+        );
+        runtime
+            .open(4, *continued, Cancellation::default())
+            .unwrap();
+        let event = next_matching(&runtime, |event| {
+            matches!(
+                event,
+                Event::Document {
+                    generation: 4,
+                    complete: true,
+                    ..
+                }
+            )
+        });
+        assert!(matches!(event, Event::Document { messages, .. } if messages.len() == 1));
+        drop(store);
         runtime.shutdown(settings).unwrap();
         drop(runtime);
         data.close().unwrap();

@@ -28,9 +28,36 @@ pub struct CopilotCli {
 }
 
 #[derive(Default, Deserialize)]
-struct WorkspaceMetadata {
+pub(super) struct WorkspaceMetadata {
     client_name: Option<String>,
+    last_client_name: Option<String>,
     name: Option<String>,
+    pub(super) cwd: Option<String>,
+}
+
+impl WorkspaceMetadata {
+    pub(super) fn read(directory: &Path) -> Result<Self> {
+        let path = directory.join("workspace.yaml");
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("Cannot read {}", path.display()));
+            }
+        };
+        serde_yaml::from_str(&text)
+            .with_context(|| format!("Invalid workspace metadata {}", path.display()))
+    }
+
+    pub(super) fn continued_in_cli(&self) -> bool {
+        self.last_client_name.as_deref() == Some("github/cli")
+    }
+
+    fn originated_in_cli(&self) -> bool {
+        self.client_name.as_deref() == Some("github/cli")
+    }
 }
 
 #[derive(Deserialize)]
@@ -66,21 +93,6 @@ impl CopilotCli {
         Ok(Self {
             source: super::source(&root, "copilot-cli")?,
         })
-    }
-
-    fn metadata(candidate: &Candidate) -> Result<WorkspaceMetadata> {
-        let path = candidate.events_path.with_file_name("workspace.yaml");
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(WorkspaceMetadata::default());
-            }
-            Err(error) => {
-                return Err(error).with_context(|| format!("Cannot read {}", path.display()));
-            }
-        };
-        serde_yaml::from_str(&text)
-            .with_context(|| format!("Invalid workspace metadata {}", path.display()))
     }
 }
 
@@ -188,6 +200,7 @@ impl AgentAdapter for CopilotCli {
         let root = self.source.root.join("session-state");
         let mut candidates = Vec::new();
         let mut diagnostics = Vec::new();
+        let mut continuations = Vec::new();
         let app_ids = if self.source.root.join("data.db").is_file() {
             match super::copilot_app::registered_ids(&self.source.root, cancel) {
                 Ok(ids) => ids,
@@ -226,9 +239,6 @@ impl AgentAdapter for CopilotCli {
                 if uuid::Uuid::parse_str(&native).is_err() {
                     return Ok(None);
                 }
-                if app_ids.contains(&native.to_lowercase()) {
-                    return Ok(None);
-                }
                 let events_path = entry.path().join("events.jsonl");
                 match events_path.metadata() {
                     Ok(metadata) if metadata.is_file() => {}
@@ -238,7 +248,12 @@ impl AgentAdapter for CopilotCli {
                 }
                 let candidate =
                     super::candidate(&self.source, native, &events_path, ReadMode::Append)?;
-                if Self::metadata(&candidate)?.client_name.as_deref() != Some("github/cli") {
+                let metadata = WorkspaceMetadata::read(&entry.path())?;
+                if metadata.continued_in_cli() {
+                    continuations.push(candidate.key.clone());
+                } else if !metadata.originated_in_cli()
+                    || app_ids.contains(&candidate.key.native.to_lowercase())
+                {
                     return Ok(None);
                 }
                 Ok(Some(candidate))
@@ -258,18 +273,38 @@ impl AgentAdapter for CopilotCli {
                 .cmp(&a.modified_ns)
                 .then_with(|| a.key.cmp(&b.key))
         });
+        let reclassified = if continuations.is_empty() {
+            Vec::new()
+        } else {
+            let app = super::source(&self.source.root, "copilot-app")?;
+            continuations
+                .into_iter()
+                .map(|current| ReclassifiedSession {
+                    previous: SessionKey {
+                        agent: app.agent.clone(),
+                        source: app.id.clone(),
+                        native: current.native.to_lowercase(),
+                    },
+                    current,
+                })
+                .collect()
+        };
         Ok(Discovery {
             candidates,
             diagnostics,
-            reclassified: Vec::new(),
+            reclassified,
         })
     }
 
     fn summarize(&self, candidate: &Candidate, cancel: &Cancellation) -> Result<Session> {
-        let metadata = Self::metadata(candidate)?;
+        let directory = candidate
+            .events_path
+            .parent()
+            .context("Invalid Copilot session location")?;
+        let metadata = WorkspaceMetadata::read(directory)?;
         anyhow::ensure!(
-            metadata.client_name.as_deref() == Some("github/cli"),
-            "Not a Copilot CLI session (client_name is not github/cli)"
+            metadata.continued_in_cli() || metadata.originated_in_cli(),
+            "Not a Copilot CLI session (neither client_name nor last_client_name is github/cli)"
         );
         summarize_log(candidate, metadata.name, cancel)
     }

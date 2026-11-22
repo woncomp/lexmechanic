@@ -407,6 +407,7 @@ impl Workbench {
                     let new = replacement.current.storage_key();
                     self.save_position();
                     self.reclassified.insert(old.clone());
+                    self.reclassified.remove(&new);
                     self.sessions.remove(&old);
                     changed.retain(|session: &Arc<Session>| {
                         session.candidate.key.storage_key() != old

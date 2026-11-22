@@ -23,11 +23,11 @@
 
 | 来源 | 会话元数据 | 对话内容 |
 | --- | --- | --- |
-| Copilot CLI | `session-state\<id>\workspace.yaml` 中的 CLI 标记与名称 | `events.jsonl` 中的顶层用户和助手消息 |
+| Copilot CLI | `session-state\<id>\workspace.yaml` 中的 `client_name` / `last_client_name` 标记与名称 | `events.jsonl` 中的顶层用户和助手消息 |
 | Copilot App | 只读查询 `data.db` 的 `sessions` / `workspaces`；workspace 路径从 `workspace.yaml` 或 `session-store.db` 补充 | 同目录下的 `session-state\<id>\events.jsonl`，与 CLI 共用消息过滤规则 |
 | VS Code | `globalStorage\github.copilot-chat\session-store.db` 中的 Copilot Chat 会话；各 workspace 的 `state.vscdb` 中的标题索引 | `workspaceStorage\<workspace>\chatSessions\<id>.jsonl` 的会话快照与增量重放 |
 
-App 登记的会话优先归属 App，不会因为共享 CLI 日志格式而再作为 CLI 导入；旧缓存中曾误归为 CLI 的同一会话会迁移为 App，保留其标签和阅读位置，避免重复显示。单一 workspace 的 App 名称优先于通用标题；没有本地日志但仍有本地目录或共享数据库记录的 App 会话可显示元数据，并明确提示正文不可用，不会伪装成空对话。
+`workspace.yaml` 中的 `last_client_name: github/cli` 优先识别为 Copilot CLI，包括从 Copilot App 分支后在 CLI 继续的会话，不受原始 `client_name` 或 App 数据库登记影响。没有此标记时，App 登记的会话优先归属 App，其余 `client_name: github/cli` 的会话归属 CLI。归属变化时会迁移旧缓存、标签和阅读位置，避免重复显示。单一 workspace 的 App 名称优先于通用标题；没有本地日志但仍有本地目录或共享数据库记录的 App 会话可显示元数据，并明确提示正文不可用，不会伪装成空对话。
 
 VS Code 重放 `kind=0/1/2` 的快照、赋值和数组追加，仅显示可见 request 的用户文本与助手文字片段，过滤隐藏 request 和工具片段。标题索引不可用时使用快照标题或首条用户内容。同一会话存在多个 transcript 副本时使用最后修改时间最新的一份并显示诊断。VS Code 时间从 request 的 `timestamp` / `responseTimestamp` 提取（毫秒时间戳），不会用标题索引的活动时间冒充首条助手消息时间。
 

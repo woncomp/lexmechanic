@@ -3,7 +3,6 @@ use crate::model::*;
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use rusqlite::Connection;
-use serde::Deserialize;
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -23,11 +22,6 @@ struct AppRecord {
 pub struct CopilotApp {
     source: Source,
     records: Mutex<HashMap<String, AppRecord>>,
-}
-
-#[derive(Default, Deserialize)]
-struct WorkspaceMetadata {
-    cwd: Option<String>,
 }
 
 pub(super) fn registered_ids(home: &Path, cancel: &Cancellation) -> Result<HashSet<String>> {
@@ -205,6 +199,18 @@ impl AgentAdapter for CopilotApp {
             if !directory.is_dir() && !records[id].shared {
                 continue;
             }
+            match copilot_cli::WorkspaceMetadata::read(&directory) {
+                Ok(metadata) if metadata.continued_in_cli() => continue,
+                Ok(_) => {}
+                Err(error) => {
+                    diagnostics.push(Diagnostic {
+                        path: directory.join("workspace.yaml"),
+                        offset: None,
+                        description: format!("{error:#}"),
+                    });
+                    continue;
+                }
+            }
             let path = directory.join("events.jsonl");
             let result = super::candidate(&self.source, id.clone(), &path, ReadMode::Append);
             match result {
@@ -270,18 +276,11 @@ impl AgentAdapter for CopilotApp {
                 available: false,
             }
         };
-        let yaml = candidate.events_path.with_file_name("workspace.yaml");
-        let cwd = match fs::read_to_string(&yaml) {
-            Ok(text) => {
-                serde_yaml::from_str::<WorkspaceMetadata>(&text)
-                    .with_context(|| format!("Invalid App workspace metadata {}", yaml.display()))?
-                    .cwd
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => {
-                return Err(error).with_context(|| format!("Cannot read {}", yaml.display()));
-            }
-        };
+        let directory = candidate
+            .events_path
+            .parent()
+            .context("Invalid Copilot App transcript location")?;
+        let cwd = copilot_cli::WorkspaceMetadata::read(directory)?.cwd;
         session.workspace = cwd
             .filter(|path| !path.is_empty())
             .or(record.workspace)
