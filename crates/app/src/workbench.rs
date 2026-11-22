@@ -12,7 +12,7 @@ use agent_chat_reader_core::{
 };
 use gpui_kit::{
     component::{
-        button::Button,
+        button::{Button, ButtonVariants},
         input::{Input, InputEvent, InputState},
         menu::{ContextMenuExt, PopupMenuItem},
         resizable::{ResizableState, h_resizable, resizable_panel},
@@ -50,6 +50,8 @@ actions!(
     ]
 );
 
+const TAB_HEIGHT: Pixels = px(32.);
+
 #[derive(Clone)]
 struct DraggedTab {
     key: String,
@@ -58,12 +60,22 @@ struct DraggedTab {
 
 impl Render for DraggedTab {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .p_3()
-            .bg(cx.theme().muted)
+        h_flex()
+            .h(TAB_HEIGHT)
+            .px_3()
+            .bg(cx.theme().tab_active)
             .border_1()
             .border_color(cx.theme().border)
-            .child(self.title.clone())
+            .shadow_md()
+            .text_sm()
+            .text_color(cx.theme().tab_active_foreground)
+            .child(
+                div()
+                    .max_w(px(190.))
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .child(self.title.clone()),
+            )
     }
 }
 
@@ -78,6 +90,8 @@ pub struct Workbench {
     pub table: Entity<TableState<SessionTable>>,
     sessions: HashMap<String, Arc<Session>>,
     tabs: Tabs,
+    tab_scroll: ScrollHandle,
+    scrolled_tab: Option<String>,
     document: Option<Document>,
     settings: Settings,
     search_input: Entity<InputState>,
@@ -300,6 +314,8 @@ impl Workbench {
             table,
             sessions: HashMap::new(),
             tabs: Tabs::default(),
+            tab_scroll: ScrollHandle::new(),
+            scrolled_tab: None,
             document: None,
             settings: Settings::default(),
             search_input,
@@ -1335,6 +1351,8 @@ impl Workbench {
                 .code_block_actions(|block, _, _| {
                     let text = block.code().to_string();
                     Button::new("copy-code")
+                        .ghost()
+                        .small()
                         .label("Copy")
                         .on_click(move |_, _, cx| {
                             cx.write_to_clipboard(ClipboardItem::new_string(text.clone()))
@@ -1385,6 +1403,8 @@ impl Workbench {
                             .gap_1()
                             .child(
                                 Button::new(("fold", index))
+                                    .ghost()
+                                    .xsmall()
                                     .label(if collapsed { "Expand" } else { "Fold" })
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         if let Some(document) = &mut this.document {
@@ -1399,16 +1419,24 @@ impl Workbench {
                                         cx.notify();
                                     })),
                             )
-                            .child(Button::new(("raw-message", index)).label("Raw").on_click(
-                                cx.listener(move |this, _, _, _| {
-                                    this.report(this.runtime.raw(this.generation, rowid));
-                                }),
-                            ))
-                            .child(Button::new(("copy-message", index)).label("Copy").on_click(
-                                cx.listener(move |this, _, _, _| {
-                                    this.report(this.runtime.copy(rowid));
-                                }),
-                            )),
+                            .child(
+                                Button::new(("raw-message", index))
+                                    .ghost()
+                                    .xsmall()
+                                    .label("Raw")
+                                    .on_click(cx.listener(move |this, _, _, _| {
+                                        this.report(this.runtime.raw(this.generation, rowid));
+                                    })),
+                            )
+                            .child(
+                                Button::new(("copy-message", index))
+                                    .ghost()
+                                    .xsmall()
+                                    .label("Copy")
+                                    .on_click(cx.listener(move |this, _, _, _| {
+                                        this.report(this.runtime.copy(rowid));
+                                    })),
+                            ),
                     ),
             );
         }
@@ -1454,6 +1482,8 @@ impl Workbench {
                         .child(div().flex_1().child("Original message text · read-only"))
                         .child(
                             Button::new("close-raw")
+                                .ghost()
+                                .small()
                                 .label("Back to conversation")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.raw_view = None;
@@ -1555,6 +1585,8 @@ impl Workbench {
                 ))
                 .child(
                     Button::new("retry-unreadable")
+                        .ghost()
+                        .small()
                         .label("Reload")
                         .on_click(cx.listener(|this, _, _, cx| this.reload_document(cx))),
                 )
@@ -1663,44 +1695,54 @@ impl Workbench {
                                     .unwrap_or_else(|| "Unknown workspace".into()),
                             ),
                     )
-                    .child(Button::new("info").label("Info").on_click(cx.listener(
-                        |this, _, _, cx| {
-                            if let Some(session) = this
-                                .tabs
-                                .active
-                                .as_ref()
-                                .and_then(|key| this.sessions.get(key))
-                            {
-                                this.status = format!(
-                                    "{} · {} · {}",
-                                    session.candidate.key.agent,
-                                    session.candidate.key.native,
-                                    session.candidate.events_path.display()
-                                );
-                                this.show_diagnostics = true;
-                                this.diagnostics.push(this.status.clone());
-                            }
-                            cx.notify();
-                        },
-                    )))
+                    .child(
+                        Button::new("info")
+                            .ghost()
+                            .small()
+                            .label("Info")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(session) = this
+                                    .tabs
+                                    .active
+                                    .as_ref()
+                                    .and_then(|key| this.sessions.get(key))
+                                {
+                                    this.status = format!(
+                                        "{} · {} · {}",
+                                        session.candidate.key.agent,
+                                        session.candidate.key.native,
+                                        session.candidate.events_path.display()
+                                    );
+                                    this.show_diagnostics = true;
+                                    this.diagnostics.push(this.status.clone());
+                                }
+                                cx.notify();
+                            })),
+                    )
                     .when(
                         self.tabs.items.iter().any(|tab| {
                             Some(&tab.key) == self.tabs.active.as_ref() && !tab.permanent
                         }),
                         |row| {
-                            row.child(Button::new("keep-tab").label("Keep tab").on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    if let Some(key) = &this.tabs.active {
-                                        this.tabs.keep(key.clone().as_str());
-                                    }
-                                    this.save_due = Some(Instant::now());
-                                    cx.notify();
-                                }),
-                            ))
+                            row.child(
+                                Button::new("keep-tab")
+                                    .ghost()
+                                    .small()
+                                    .label("Keep tab")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(key) = &this.tabs.active {
+                                            this.tabs.keep(key.clone().as_str());
+                                        }
+                                        this.save_due = Some(Instant::now());
+                                        cx.notify();
+                                    })),
+                            )
                         },
                     )
                     .child(
                         Button::new("export")
+                            .ghost()
+                            .small()
                             .label("Export Markdown")
                             .on_click(cx.listener(|this, _, _, cx| this.export(cx))),
                     ),
@@ -1711,17 +1753,33 @@ impl Workbench {
                         .p_2()
                         .gap_2()
                         .child(div().flex_1().child(Input::new(&self.find_input)))
-                        .child(Button::new("find-prev").label("Previous").on_click(
-                            cx.listener(|this, _, window, cx| this.step_hit(true, window, cx)),
-                        ))
-                        .child(Button::new("find-next").label("Next").on_click(
-                            cx.listener(|this, _, window, cx| this.step_hit(false, window, cx)),
-                        ))
+                        .child(
+                            Button::new("find-prev")
+                                .ghost()
+                                .small()
+                                .label("Previous")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.step_hit(true, window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("find-next")
+                                .ghost()
+                                .small()
+                                .label("Next")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.step_hit(false, window, cx)
+                                })),
+                        )
                         .when(self.more_hits.is_some(), |row| {
                             row.child(
-                                Button::new("find-more").label("More matches").on_click(
-                                    cx.listener(|this, _, _, cx| this.next_search_page(cx)),
-                                ),
+                                Button::new("find-more")
+                                    .ghost()
+                                    .small()
+                                    .label("More matches")
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.next_search_page(cx)),
+                                    ),
                             )
                         })
                         .child(format!(
@@ -1759,26 +1817,36 @@ impl Workbench {
                     .child(div().flex_1())
                     .child(
                         Button::new("reload-document")
+                            .ghost()
+                            .small()
                             .label("Reload")
                             .on_click(cx.listener(|this, _, _, cx| this.reload_document(cx))),
                     )
                     .child(div().w(px(100.)).child(Input::new(&self.jump_input)))
-                    .child(Button::new("top").label("Top").on_click(cx.listener(
-                        |this, _, _, cx| {
-                            if let Some(document) = &mut this.document {
-                                document.jump(0);
-                            }
-                            cx.notify();
-                        },
-                    )))
-                    .child(Button::new("latest").label("Latest").on_click(cx.listener(
-                        |this, _, _, cx| {
-                            if let Some(document) = &mut this.document {
-                                document.jump(document.messages.len().saturating_sub(1));
-                            }
-                            cx.notify();
-                        },
-                    ))),
+                    .child(
+                        Button::new("top")
+                            .ghost()
+                            .small()
+                            .label("Top")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(document) = &mut this.document {
+                                    document.jump(0);
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("latest")
+                            .ghost()
+                            .small()
+                            .label("Latest")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(document) = &mut this.document {
+                                    document.jump(document.messages.len().saturating_sub(1));
+                                }
+                                cx.notify();
+                            })),
+                    ),
             )
             .into_any_element()
     }
@@ -1795,6 +1863,8 @@ impl Workbench {
                     .gap_2()
                     .child(
                         Button::new("back")
+                            .ghost()
+                            .small()
                             .label("Back to sessions")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.search_mode = false;
@@ -1815,6 +1885,8 @@ impl Workbench {
                     .when(self.more_hits.is_some(), |row| {
                         row.child(
                             Button::new("search-more")
+                                .ghost()
+                                .small()
                                 .label("Next page")
                                 .on_click(cx.listener(|this, _, _, cx| this.next_search_page(cx))),
                         )
@@ -1826,6 +1898,8 @@ impl Workbench {
                     .gap_1()
                     .child(
                         Button::new("search-role")
+                            .ghost()
+                            .small()
                             .label(match self.role_filter {
                                 None => "All roles",
                                 Some(Role::User) => "User",
@@ -1843,6 +1917,8 @@ impl Workbench {
                     )
                     .child(
                         Button::new("search-workspace")
+                            .ghost()
+                            .small()
                             .label(if self.workspace_scope {
                                 "Active workspace"
                             } else {
@@ -1869,6 +1945,8 @@ impl Workbench {
                     )
                     .child(
                         Button::new("search-dates")
+                            .ghost()
+                            .small()
                             .label(match self.date_filter {
                                 None => "All dates",
                                 Some(7) => "7 days",
@@ -1973,16 +2051,22 @@ impl Workbench {
                     .child(div().flex_1().child("Sources & reading preferences"))
                     .child(
                         Button::new("choose-source")
+                            .ghost()
+                            .small()
                             .label("Add Copilot home…")
                             .on_click(cx.listener(|this, _, _, cx| this.pick_source(false, cx))),
                     )
                     .child(
                         Button::new("choose-vscode-source")
+                            .ghost()
+                            .small()
                             .label("Add VS Code User…")
                             .on_click(cx.listener(|this, _, _, cx| this.pick_source(true, cx))),
                     )
                     .child(
                         Button::new("default-source")
+                            .ghost()
+                            .small()
                             .label("Use default source")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.settings.sources.clear();
@@ -1993,6 +2077,8 @@ impl Workbench {
                     )
                     .child(
                         Button::new("theme")
+                            .ghost()
+                            .small()
                             .label("Toggle theme")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 let dark = !cx.theme().is_dark();
@@ -2009,18 +2095,28 @@ impl Workbench {
                                 this.save_due = Some(Instant::now());
                             })),
                     )
-                    .child(Button::new("font-minus").label("A−").on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.change_font(-1., cx);
-                        },
-                    )))
-                    .child(Button::new("font-plus").label("A+").on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.change_font(1., cx);
-                        },
-                    )))
+                    .child(
+                        Button::new("font-minus")
+                            .ghost()
+                            .small()
+                            .label("A−")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.change_font(-1., cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("font-plus")
+                            .ghost()
+                            .small()
+                            .label("A+")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.change_font(1., cx);
+                            })),
+                    )
                     .child(
                         Button::new("system-theme")
+                            .ghost()
+                            .small()
                             .label("System theme")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.settings.dark = None;
@@ -2030,6 +2126,8 @@ impl Workbench {
                     )
                     .child(
                         Button::new("clear")
+                            .ghost()
+                            .small()
                             .label("Clear local index")
                             .on_click(cx.listener(|this, _, _, cx| this.clear_index(cx))),
                     ),
@@ -2075,54 +2173,115 @@ impl Workbench {
     }
 }
 
-impl Render for Workbench {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.focus_document {
-            self.focus_document = false;
-            self.doc_focus.focus(window, cx);
-        }
+impl Workbench {
+    fn render_tab_strip(&self, cx: &mut Context<Self>) -> AnyElement {
+        let tab_count = self.tabs.items.len();
+        let active_index = active_tab_index(&self.tabs);
         let tabs: Vec<_> = self
             .tabs
             .items
             .iter()
-            .map(|tab| {
+            .enumerate()
+            .map(|(index, tab)| {
                 let key = tab.key.clone();
                 let close_key = key.clone();
+                let middle_key = key.clone();
                 let drop_key = key.clone();
                 let menu_key = key.clone();
                 let owner = cx.weak_entity();
-                let active = self.tabs.active.as_ref() == Some(&key);
+                let active = active_index == Some(index);
                 let permanent = tab.permanent;
+                let group = SharedString::from(format!("tab-group-{key}"));
+                let (text_color, background) = if active {
+                    (cx.theme().tab_active_foreground, cx.theme().tab_active)
+                } else {
+                    (cx.theme().muted_foreground, cx.theme().tab_bar)
+                };
                 h_flex()
                     .id(SharedString::from(format!("tab-{key}")))
-                    .gap_2()
-                    .px_3()
-                    .h(px(38.))
-                    .border_r_1()
+                    .group(group.clone())
+                    .h(TAB_HEIGHT)
+                    .flex_shrink_0()
+                    .bg(background)
                     .border_color(cx.theme().border)
                     .cursor_pointer()
-                    .when(active, |tab| {
-                        tab.bg(cx.theme().background)
-                            .border_b_2()
-                            .border_color(cx.theme().primary)
+                    // Same border scheme as Zed: the active tab has no bottom border so it
+                    // merges with the content; the 1px padding keeps tab sizes stable.
+                    .map(|this| {
+                        let relative = active_index.map(|active| index.cmp(&active));
+                        if index == 0 {
+                            if active {
+                                this.pl_px().border_r_1().pb_px()
+                            } else {
+                                this.pl_px().pr_px().border_b_1()
+                            }
+                        } else if index + 1 == tab_count {
+                            if active {
+                                this.border_l_1().border_r_1().pb_px()
+                            } else {
+                                this.pl_px().border_b_1().border_r_1()
+                            }
+                        } else {
+                            match relative {
+                                Some(std::cmp::Ordering::Equal) => {
+                                    this.border_l_1().border_r_1().pb_px()
+                                }
+                                Some(std::cmp::Ordering::Less) => {
+                                    this.border_l_1().pr_px().border_b_1()
+                                }
+                                _ => this.border_r_1().pl_px().border_b_1(),
+                            }
+                        }
+                    })
+                    .when(!active, |this| {
+                        this.hover(|style| {
+                            style
+                                .bg(cx.theme().secondary_hover)
+                                .text_color(cx.theme().foreground)
+                        })
                     })
                     .child(
-                        div()
-                            .max_w(px(190.))
-                            .text_sm()
-                            .text_ellipsis()
-                            .overflow_hidden()
-                            .when(!permanent, |title| title.italic())
-                            .child(tab.title.clone()),
+                        h_flex()
+                            .h(TAB_HEIGHT - px(1.))
+                            .pl_3()
+                            .pr_1()
+                            .gap_1()
+                            .text_color(text_color)
+                            .child(
+                                div()
+                                    .max_w(px(190.))
+                                    .text_sm()
+                                    .text_ellipsis()
+                                    .overflow_hidden()
+                                    .when(!permanent, |title| title.italic())
+                                    .child(tab.title.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .when(!active, |slot| {
+                                        slot.invisible()
+                                            .group_hover(group.clone(), |style| style.visible())
+                                    })
+                                    .child(
+                                        Button::new(SharedString::from(format!("close-{key}")))
+                                            .icon(IconName::Close)
+                                            .ghost()
+                                            .xsmall()
+                                            .tooltip("Close Tab")
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                cx.stop_propagation();
+                                                this.close(&close_key, window, cx);
+                                            })),
+                                    ),
+                            ),
                     )
-                    .child(
-                        Button::new(SharedString::from(format!("close-{key}")))
-                            .label("×")
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.close(&close_key, window, cx);
-                            })),
-                    )
+                    .on_aux_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        if event.is_middle_click() {
+                            this.close(&middle_key, window, cx);
+                            cx.stop_propagation();
+                        }
+                    }))
                     .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                         if event.click_count() >= 2 {
                             this.tabs.keep(&key);
@@ -2137,6 +2296,12 @@ impl Render for Workbench {
                         },
                         |drag, _, _, cx| cx.new(|_| drag.clone()),
                     )
+                    .drag_over::<DraggedTab>(|style, _, _, cx| {
+                        style
+                            .bg(cx.theme().drag_border.opacity(0.15))
+                            .border_l_2()
+                            .border_color(cx.theme().drag_border)
+                    })
                     .on_drop(cx.listener(move |this, drag: &DraggedTab, _, cx| {
                         this.tabs.move_before(&drag.key, &drop_key);
                         this.save_due = Some(Instant::now());
@@ -2200,6 +2365,68 @@ impl Render for Workbench {
                     })
             })
             .collect();
+        div()
+            .relative()
+            .h(TAB_HEIGHT)
+            .flex_shrink_0()
+            .bg(cx.theme().tab_bar)
+            // Baseline under the tabs; the active tab covers it.
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .border_b_1()
+                    .border_color(cx.theme().border),
+            )
+            .child(
+                h_flex()
+                    .id("tabs")
+                    .size_full()
+                    .overflow_x_scroll()
+                    .track_scroll(&self.tab_scroll)
+                    .children(tabs)
+                    .child(
+                        div()
+                            .id("tabs-end")
+                            .flex_1()
+                            .h_full()
+                            .min_w(px(24.))
+                            .drag_over::<DraggedTab>(|style, _, _, cx| {
+                                style.bg(cx.theme().drag_border.opacity(0.15))
+                            })
+                            .on_drop(cx.listener(|this, drag: &DraggedTab, _, cx| {
+                                this.tabs.move_before(&drag.key, "");
+                                this.save_due = Some(Instant::now());
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+}
+
+fn active_tab_index(tabs: &Tabs) -> Option<usize> {
+    tabs.items
+        .iter()
+        .position(|tab| tabs.active.as_ref() == Some(&tab.key))
+}
+
+impl Render for Workbench {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.focus_document {
+            self.focus_document = false;
+            self.doc_focus.focus(window, cx);
+        }
+        // Reveal the active tab when it changes, as Zed does.
+        if self.scrolled_tab != self.tabs.active {
+            self.scrolled_tab = self.tabs.active.clone();
+            if let Some(index) = active_tab_index(&self.tabs) {
+                self.tab_scroll.scroll_to_item(index);
+            }
+        }
+        let tab_strip = self.render_tab_strip(cx);
         let doc = self.render_document(cx);
         let sidebar = if self.search_mode {
             self.render_search(cx)
@@ -2214,6 +2441,8 @@ impl Render for Workbench {
                         .child(div().flex_1().child(Input::new(&self.filter_input)))
                         .child(
                             Button::new("date-filter")
+                                .ghost()
+                                .small()
                                 .label(match self.table.read(cx).delegate().days {
                                     None => "All dates",
                                     Some(7) => "7 days",
@@ -2404,21 +2633,33 @@ impl Render for Workbench {
             )
             .child(
                 h_flex()
-                    .h(px(56.))
-                    .px_4()
-                    .gap_3()
+                    .h(px(40.))
+                    .px_3()
+                    .gap_2()
+                    .bg(cx.theme().title_bar)
                     .border_b_1()
                     .border_color(cx.theme().border)
-                    .child(div().font_weight(FontWeight::BOLD).child("AgentChatReader"))
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("AgentChatReader"),
+                    )
                     .child(div().flex_1().child(Input::new(&self.search_input)))
                     .child(
                         Button::new("refresh")
-                            .label("Refresh")
+                            .icon(IconName::RefreshCw)
+                            .ghost()
+                            .small()
+                            .tooltip("Refresh")
                             .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
                     )
                     .child(
                         Button::new("settings")
-                            .label("Settings")
+                            .icon(IconName::Settings)
+                            .ghost()
+                            .small()
+                            .tooltip("Settings")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.show_settings = !this.show_settings;
                                 cx.notify();
@@ -2454,18 +2695,22 @@ impl Render for Workbench {
                                         .child(
                                             h_flex()
                                                 .px_3()
-                                                .h(px(38.))
+                                                .h(TAB_HEIGHT)
                                                 .justify_between()
+                                                .bg(cx.theme().tab_bar)
                                                 .border_b_1()
                                                 .border_color(cx.theme().border)
                                                 .child(
                                                     div()
                                                         .text_xs()
                                                         .font_weight(FontWeight::SEMIBOLD)
+                                                        .text_color(cx.theme().muted_foreground)
                                                         .child("SESSIONS"),
                                                 )
                                                 .child(
                                                     Button::new("time-mode")
+                                                        .ghost()
+                                                        .xsmall()
                                                         .label(match self.settings.mode {
                                                             TimeMode::Latest => "Latest message ↓",
                                                             TimeMode::FirstAssistant => {
@@ -2485,15 +2730,7 @@ impl Render for Workbench {
                                 v_flex()
                                     .size_full()
                                     .min_h_0()
-                                    .child(
-                                        h_flex()
-                                            .id("tabs")
-                                            .h(px(38.))
-                                            .flex_shrink_0()
-                                            .overflow_x_scroll()
-                                            .bg(cx.theme().muted)
-                                            .children(tabs),
-                                    )
+                                    .child(tab_strip)
                                     .child(div().flex_1().min_h_0().child(doc)),
                             ),
                         ),
@@ -2523,9 +2760,11 @@ impl Render for Workbench {
                     .flex_shrink_0()
                     .px_3()
                     .gap_4()
+                    .bg(cx.theme().title_bar)
                     .border_t_1()
                     .border_color(cx.theme().border)
                     .text_xs()
+                    .text_color(cx.theme().muted_foreground)
                     .child(
                         div()
                             .id("index-progress")
@@ -2542,6 +2781,8 @@ impl Render for Workbench {
                     )
                     .child(
                         Button::new("diagnostic-count")
+                            .ghost()
+                            .xsmall()
                             .label(format!("{} notices", self.diagnostics.len()))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.show_diagnostics = !this.show_diagnostics;
