@@ -10,15 +10,15 @@ try {
     $output = [IO.Path]::GetFullPath($OutputDirectory)
     [void](New-Item -ItemType Directory -Force -Path $output)
     $staging = (New-Item -ItemType Directory -Path (Join-Path $output ('.package-' + [guid]::NewGuid()))).FullName
-    $bundle = Join-Path $staging 'AgentChatReader'
+    $bundle = Join-Path $staging 'Lexmechanic'
     [void](New-Item -ItemType Directory -Force -Path $bundle)
-    Copy-Item -LiteralPath 'target\release\AgentChatReader.exe' -Destination $bundle
+    Copy-Item -LiteralPath 'target\release\Lexmechanic.exe' -Destination $bundle
     Copy-Item -LiteralPath 'README.md' -Destination $bundle
     $metadataJson = cargo metadata --format-version 1 --locked --filter-platform x86_64-pc-windows-msvc
     if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect dependency licenses.' }
     $metadata = $metadataJson | ConvertFrom-Json
     $notices = [Collections.Generic.List[string]]::new()
-    $notices.Add("AgentChatReader - third-party dependency notices`n")
+    $notices.Add("Lexmechanic - third-party dependency notices`n")
     $licenses = Join-Path $bundle 'licenses'
     [void](New-Item -ItemType Directory -Force -Path $licenses)
     foreach ($package in ($metadata.packages | Sort-Object name, version)) {
@@ -41,9 +41,9 @@ try {
     foreach ($file in (Get-ChildItem -LiteralPath $bundle -File -Recurse)) {
         if ($file.LastWriteTime.Year -lt 1980) { $file.LastWriteTime = [datetime]'1980-01-02' }
     }
-    $archive = Join-Path $output 'AgentChatReader-windows-x64.zip'
+    $archive = Join-Path $output 'Lexmechanic-windows-x64.zip'
     Compress-Archive -LiteralPath $bundle -DestinationPath $archive -Force
-    $published = Join-Path $output 'AgentChatReader'
+    $published = Join-Path $output 'Lexmechanic'
     [void](New-Item -ItemType Directory -Force -Path $published)
     foreach ($item in (Get-ChildItem -LiteralPath $bundle)) {
         Copy-Item -LiteralPath $item.FullName -Destination $published -Recurse -Force

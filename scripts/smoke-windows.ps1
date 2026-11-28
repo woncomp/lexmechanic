@@ -25,7 +25,7 @@ public static class ReaderSmokeNative {
 }
 
 $env:COPILOT_HOME = (Resolve-Path -LiteralPath $CopilotHome).Path
-$env:AGENT_CHAT_READER_DATA_DIR = [IO.Path]::GetFullPath($DataDirectory)
+$env:LEXMECHANIC_DATA_DIR = [IO.Path]::GetFullPath($DataDirectory)
 if (Test-Path -LiteralPath (Join-Path $DataDirectory 'settings.json')) {
     throw 'Use a fresh application data directory so saved tabs cannot produce a false positive.'
 }
@@ -39,8 +39,8 @@ try {
     Start-Sleep -Seconds 5
     $process.Refresh()
     if ($process.HasExited) { throw "Application exited early: $($process.ExitCode)" }
-    if ($process.MainWindowTitle -ne 'AgentChatReader' -or -not $process.Responding) {
-        throw 'AgentChatReader did not open a responsive window.'
+    if ($process.MainWindowTitle -ne 'Lexmechanic' -or -not $process.Responding) {
+        throw 'Lexmechanic did not open a responsive window.'
     }
     $window = $process.MainWindowHandle
     [void][ReaderSmokeNative]::SetForegroundWindow($window)

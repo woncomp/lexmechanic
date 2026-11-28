@@ -313,20 +313,20 @@ impl Workbench {
             },
         ));
         cx.bind_keys([
-            KeyBinding::new("ctrl-shift-f", FindAll, Some("AgentChatReader")),
-            KeyBinding::new("ctrl-f", FindDocument, Some("AgentChatReader")),
-            KeyBinding::new("ctrl-w", CloseTab, Some("AgentChatReader")),
-            KeyBinding::new("ctrl-shift-t", ReopenTab, Some("AgentChatReader")),
-            KeyBinding::new("ctrl-tab", NextTab, Some("AgentChatReader")),
-            KeyBinding::new("ctrl-shift-tab", PreviousTab, Some("AgentChatReader")),
+            KeyBinding::new("ctrl-shift-f", FindAll, Some("Lexmechanic")),
+            KeyBinding::new("ctrl-f", FindDocument, Some("Lexmechanic")),
+            KeyBinding::new("ctrl-w", CloseTab, Some("Lexmechanic")),
+            KeyBinding::new("ctrl-shift-t", ReopenTab, Some("Lexmechanic")),
+            KeyBinding::new("ctrl-tab", NextTab, Some("Lexmechanic")),
+            KeyBinding::new("ctrl-shift-tab", PreviousTab, Some("Lexmechanic")),
             KeyBinding::new("enter", OpenSelected, Some("DataTable")),
             KeyBinding::new("space", PreviewSelected, Some("DataTable")),
             KeyBinding::new("alt-down", NextMessage, Some("ReaderDocument")),
             KeyBinding::new("alt-up", PreviousMessage, Some("ReaderDocument")),
-            KeyBinding::new("escape", Escape, Some("AgentChatReader")),
-            KeyBinding::new("f5", Refresh, Some("AgentChatReader")),
-            KeyBinding::new("f3", NextHit, Some("AgentChatReader")),
-            KeyBinding::new("shift-f3", PreviousHit, Some("AgentChatReader")),
+            KeyBinding::new("escape", Escape, Some("Lexmechanic")),
+            KeyBinding::new("f5", Refresh, Some("Lexmechanic")),
+            KeyBinding::new("f3", NextHit, Some("Lexmechanic")),
+            KeyBinding::new("shift-f3", PreviousHit, Some("Lexmechanic")),
         ]);
         let executor = cx.background_executor().clone();
         cx.spawn(async move |this, cx| {
@@ -2595,7 +2595,7 @@ impl Render for Workbench {
         };
         v_flex()
             .id("agent-chat-reader")
-            .key_context("AgentChatReader")
+            .key_context("Lexmechanic")
             .track_focus(&self.focus)
             .size_full()
             .font_family("Segoe UI")
@@ -2746,7 +2746,7 @@ impl Render for Workbench {
                         div()
                             .text_sm()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child("AgentChatReader"),
+                            .child("Lexmechanic"),
                     )
                     .child(div().flex_1().child(Input::new(&self.search_input)))
                     .child(

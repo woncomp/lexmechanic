@@ -11,19 +11,21 @@ mod tabs;
 mod workbench;
 
 fn main() {
-    let directory = std::env::var_os("AGENT_CHAT_READER_DATA_DIR")
+    let directory = std::env::var_os("LEXMECHANIC_DATA_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
-            directories::ProjectDirs::from("", "", "AgentChatReader")
+            let directory = directories::ProjectDirs::from("", "", "Lexmechanic")
                 .expect("Cannot locate application data directory")
                 .data_local_dir()
-                .to_owned()
+                .to_owned();
+            migrate_legacy_data(&directory);
+            directory
         });
     std::fs::create_dir_all(&directory).expect("Cannot create application data directory");
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(directory.join("AgentChatReader.log"))
+        .open(directory.join("Lexmechanic.log"))
         .expect("Cannot open application log");
     tracing_subscriber::fmt()
         .with_ansi(false)
@@ -43,7 +45,7 @@ fn main() {
             gpui_kit::open_window(
                 WindowOptions {
                     titlebar: Some(TitlebarOptions {
-                        title: Some("AgentChatReader".into()),
+                        title: Some("Lexmechanic".into()),
                         ..Default::default()
                     }),
                     window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
@@ -56,7 +58,26 @@ fn main() {
                 cx,
                 |window, cx| cx.new(|cx| workbench::Workbench::new(directory, window, cx)),
             )
-            .expect("Could not open AgentChatReader window");
+            .expect("Could not open Lexmechanic window");
             cx.activate(true);
         });
+}
+
+/// Carries the index, settings and logs over from the app's former name, once.
+fn migrate_legacy_data(directory: &std::path::Path) {
+    if directory.exists() {
+        return;
+    }
+    let Some(legacy) = directories::ProjectDirs::from("", "", "AgentChatReader") else {
+        return;
+    };
+    let legacy = legacy.data_local_dir();
+    if !legacy.is_dir() {
+        return;
+    }
+    if let Some(parent) = directory.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Left in place on failure: the app then starts with a fresh data directory.
+    let _ = std::fs::rename(legacy, directory);
 }

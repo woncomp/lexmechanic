@@ -1,10 +1,10 @@
-# AgentChatReader
+# Lexmechanic
 
 基于 Rust / GPUI 的 Windows x64 桌面会话阅读器。只读扫描本机 Agent 缓存，在一个工作台中浏览、搜索和导出历史对话。支持 **Copilot CLI、Copilot App、Codex、VS Code 中的 GitHub Copilot Chat，以及 VS Code Agents 窗口中的 Copilot / Codex / Claude 会话**；无需 GitHub 登录、Python 或模型服务。
 
 ## 使用
 
-运行便携包中的 `AgentChatReader.exe`。首次启动扫描 `COPILOT_HOME`（未设置时为 `%USERPROFILE%\.copilot`）中的 CLI / App 会话，并自动发现 `%APPDATA%\Code\User` 与 `%APPDATA%\Code - Insiders\User` 中的 VS Code Copilot 会话；存在 `globalStorage\agent-host.db` 时同时读取 VS Code Agents 会话（Codex 默认读 `CODEX_HOME` 或 `%USERPROFILE%\.codex`，Claude 默认读 `CLAUDE_CONFIG_DIR` 或 `%USERPROFILE%\.claude`）。Codex 自身的会话默认读取同一个 Codex 目录，可在 **Add Codex home…** 选择其他包含 `sessions` 或 `archived_sessions` 的目录。可在 **Settings → Add Copilot home…** 选择包含 `session-state` 或 App `data.db` 的目录，在 **Add VS Code User…** 选择包含 `globalStorage` 和 `workspaceStorage` 的 VS Code `User` 目录。
+运行便携包中的 `Lexmechanic.exe`。首次启动扫描 `COPILOT_HOME`（未设置时为 `%USERPROFILE%\.copilot`）中的 CLI / App 会话，并自动发现 `%APPDATA%\Code\User` 与 `%APPDATA%\Code - Insiders\User` 中的 VS Code Copilot 会话；存在 `globalStorage\agent-host.db` 时同时读取 VS Code Agents 会话（Codex 默认读 `CODEX_HOME` 或 `%USERPROFILE%\.codex`，Claude 默认读 `CLAUDE_CONFIG_DIR` 或 `%USERPROFILE%\.claude`）。Codex 自身的会话默认读取同一个 Codex 目录，可在 **Add Codex home…** 选择其他包含 `sessions` 或 `archived_sessions` 的目录。可在 **Settings → Add Copilot home…** 选择包含 `session-state` 或 App `data.db` 的目录，在 **Add VS Code User…** 选择包含 `globalStorage` 和 `workspaceStorage` 的 VS Code `User` 目录。
 
 - 左侧四列表格：无标题的 Agent 图标列、日期、workspace、会话名。悬停图标显示对应 Agent 名称。Date 只显示 `MM-DD`，悬停显示完整本地日期、时间及 UTC 偏移；排序仍使用完整时间，不按月日文本排序。旧版列宽自动迁移，日期默认缩窄。
 - **扫描顺序与展示排序独立**：每个 Agent 在独立工作线程中按日志文件修改时间从新到旧扫描，覆盖全部历史；结果按消息时间插入统一总表。
@@ -61,7 +61,7 @@ VS Code 追加 delta 可能改写已有回复，因此显式准备新内容时�
 
 ### 数据与隐私
 
-索引、配置和诊断日志位于 `%LOCALAPPDATA%\AgentChatReader\data`（由 Windows 标准应用目录 API 解析）。可设置 `AGENT_CHAT_READER_DATA_DIR` 为独立应用数据目录，例如用于合成数据测试。
+索引、配置和诊断日志位于 `%LOCALAPPDATA%\Lexmechanic\data`（由 Windows 标准应用目录 API 解析）；首次启动时若该目录不存在，会自动迁移旧名称 `%LOCALAPPDATA%\AgentChatReader\data` 中的数据。可设置 `LEXMECHANIC_DATA_DIR` 为独立应用数据目录，例如用于合成数据测试。
 
 SQLite 索引包含会话正文，**不是加密数据库**。请按原始会话数据的敏感程度保护该目录。程序不上传会话，普通诊断不记录正文。清除本地索引不修改 Agent 缓存；原始来源丢失、损坏或不可读会显示通知。
 
@@ -83,7 +83,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 .\scripts\package-windows.ps1
 ```
 
-发行输出为 `dist\AgentChatReader\AgentChatReader.exe` 与 `dist\AgentChatReader-windows-x64.zip`，包含依赖许可说明。便携包不提供安装器、自动更新或代码签名。需要支持所选 GPUI Windows GPU 后端的显卡与驱动；启动失败时查看应用数据目录中的 `AgentChatReader.log`。
+发行输出为 `dist\Lexmechanic\Lexmechanic.exe` 与 `dist\Lexmechanic-windows-x64.zip`，包含依赖许可说明。便携包不提供安装器、自动更新或代码签名。需要支持所选 GPUI Windows GPU 后端的显卡与驱动；启动失败时查看应用数据目录中的 `Lexmechanic.log`。
 
 GPUI Kit 与其匹配的 GPUI snapshot 由版本及 `Cargo.lock` 锁定；不要单独替换其中一份 GPUI 依赖。Windows 目标通过 `.cargo\config.toml` 静态链接 C 运行库，发行包不要求另装 Visual C++ Redistributable。
 
@@ -96,6 +96,7 @@ GPUI Kit 与其匹配的 GPUI snapshot 由版本及 `Cargo.lock` 锁定；不要
 - 正文/渲染状态有字节预算和实体数量限制，切换标签释放旧渲染状态。SQLite FTS5 trigram 缩小较长查询候选；短词采用可取消的精确扫描。旧请求不能覆盖新选择。
 - 追加解析只消费本次捕获文件长度内的新完整记录；半条 JSON 不会提前越过索引游标，也不会让搜索永久等待。文件截断、替换或检查点不一致在下一次用户操作中重建相应会话；中间坏行保留明确诊断，其他会话继续可用。
 - VS Code 的快照重放在后台按行读取并支持取消，最多保留一个已重放的会话，不将全部历史状态常驻内存；单个 VS Code 会话仍需还原完整状态，内存开销与该会话大小相关。
+- `assets\app\app-icon.ico` 为程序图标（顶部卷轴展开、下端残破泛黄的旧卷轴），由 `crates\app\build.rs` 写入 exe 资源，Windows 标题栏与任务栏亦使用它；含 16–256 px 多尺寸，矢量源为 `assets\app\app-icon.svg`（32 px 及以下使用去掉细节的精简版绘制）。
 - `assets\agents` 中的图标嵌入可执行文件；Copilot App 保持 PNG，VS Code 使用 SVG。Copilot CLI、Codex、VS Code Agents - Copilot 与 VS Code Agents - Codex 各有浅色、深色两份图标，按当前主题选用；VS Code Agents 图标以对应驱动标识为主体，右下角叠加矢量 Sessions 标识，Claude 使用单份图标。发行包不依赖原始图标路径。
 - 可重建索引使用 SQLite WAL / NORMAL：事务中的正文、FTS 与游标保持原子一致，断电时尚未持久化的索引进度允许从原始日志重新生成；不以此降低原始数据或设置文件的持久化要求。
 
@@ -107,7 +108,7 @@ GPUI Kit 与其匹配的 GPUI snapshot 由版本及 `Cargo.lock` 锁定；不要
 cargo run -p agent-chat-reader-core --release --example fixtures -- generate target\synthetic 1000 100 4096
 cargo run -p agent-chat-reader-core --release --example fixtures -- scan target\synthetic target\synthetic.sqlite
 .\scripts\smoke-windows.ps1 `
-    -Executable target\debug\AgentChatReader.exe `
+    -Executable target\debug\Lexmechanic.exe `
     -CopilotHome target\synthetic `
     -DataDirectory target\synthetic-app
 ```
