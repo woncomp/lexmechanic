@@ -317,16 +317,12 @@ impl TableDelegate for SessionTable {
                 .justify_center()
                 .tooltip(move |window, cx| Tooltip::new(name.clone()).build(window, cx));
             return match icon {
-                Some(path) if crate::assets::agent_icon_is_glyph(&agent) => cell
-                    .child(
-                        svg()
-                            .path(path)
-                            .size(px(18.))
-                            .text_color(cx.theme().foreground),
-                    )
-                    .into_any_element(),
                 Some(path) => cell
-                    .child(img(path).size(px(18.)).object_fit(ObjectFit::Contain))
+                    .child(
+                        img(crate::assets::icon_source(path, 18.))
+                            .size(px(18.))
+                            .object_fit(ObjectFit::Contain),
+                    )
                     .into_any_element(),
                 None => cell.child("?").into_any_element(),
             };

@@ -1,12 +1,50 @@
-use gpui_kit::{AssetSource, SharedString};
-use std::borrow::Cow;
+use gpui_kit::{
+    App, Asset, AssetSource, DevicePixels, ImageCacheError, ImageSource, RenderImage, SharedString,
+    SvgSize, size,
+};
+use std::{borrow::Cow, future::Future, sync::Arc};
 
 pub struct Assets;
 
-/// A single-colour mark drawn in the current text colour, so it suits both light and dark
-/// themes; the other icons keep their own colours.
-pub fn agent_icon_is_glyph(agent: &str) -> bool {
-    agent == "codex"
+/// SVG icons rasterized at exactly the device-pixel size they are shown at.
+///
+/// `img()` rasterizes an SVG once at the size the file declares and lets the GPU shrink the
+/// bitmap, which turns fine lines ragged when the declared size is far larger than the icon.
+enum SharpSvg {}
+
+impl Asset for SharpSvg {
+    /// The asset path and the edge length in device pixels.
+    type Source = (SharedString, i32);
+    type Output = Result<Arc<RenderImage>, ImageCacheError>;
+
+    fn load(
+        (path, pixels): Self::Source,
+        cx: &mut App,
+    ) -> impl Future<Output = Self::Output> + Send + 'static {
+        let renderer = cx.svg_renderer();
+        let assets = cx.asset_source().clone();
+        async move {
+            let bytes = assets
+                .load(&path)
+                .map_err(|error| ImageCacheError::Other(Arc::new(error)))?
+                .ok_or_else(|| ImageCacheError::Asset(format!("Missing icon {path}").into()))?;
+            let svg = renderer.parse_svg(&bytes)?;
+            let edge = DevicePixels(pixels);
+            Ok(renderer.render_parsed(&svg, SvgSize::Size(size(edge, edge)))?)
+        }
+    }
+}
+
+/// An icon shown `logical` pixels square: SVGs are rasterized for the window's scale factor,
+/// bitmaps are drawn as they are.
+pub fn icon_source(path: &'static str, logical: f32) -> ImageSource {
+    if !path.ends_with(".svg") {
+        return path.into();
+    }
+    ImageSource::Custom(Arc::new(move |window, cx| {
+        let pixels = (logical * window.scale_factor()).ceil() as i32;
+        window.use_asset::<SharpSvg>(&(path.into(), pixels), cx)
+    }))
 }
 
 /// The icon for an agent; a few have separate artwork for the dark theme.
@@ -14,7 +52,8 @@ pub fn agent_icon(agent: &str, dark: bool) -> Option<&'static str> {
     match agent {
         "copilot-cli" => Some("agents/copilot-cli.svg"),
         "copilot-app" => Some("agents/copilot-app.png"),
-        "codex" => Some("agents/codex.svg"),
+        "codex" if dark => Some("agents/codex-dark.svg"),
+        "codex" => Some("agents/codex-light.svg"),
         "vscode" => Some("agents/vscode.svg"),
         "vscode-agents-copilot" => Some("agents/vscode-agents-copilot.svg"),
         "vscode-agents-claude" => Some("agents/vscode-agents-claude.svg"),
@@ -33,7 +72,12 @@ impl AssetSource for Assets {
             "agents/copilot-app.png" => {
                 Some(include_bytes!("../../../assets/agents/copilot-app.png"))
             }
-            "agents/codex.svg" => Some(include_bytes!("../../../assets/agents/codex.svg")),
+            "agents/codex-light.svg" => {
+                Some(include_bytes!("../../../assets/agents/codex-light.svg"))
+            }
+            "agents/codex-dark.svg" => {
+                Some(include_bytes!("../../../assets/agents/codex-dark.svg"))
+            }
             "agents/vscode.svg" => Some(include_bytes!("../../../assets/agents/vscode.svg")),
             "agents/vscode-agents-copilot.svg" => Some(include_bytes!(
                 "../../../assets/agents/vscode-agents-copilot.svg"
@@ -61,7 +105,8 @@ impl AssetSource for Assets {
             [
                 "agents/copilot-cli.svg",
                 "agents/copilot-app.png",
-                "agents/codex.svg",
+                "agents/codex-light.svg",
+                "agents/codex-dark.svg",
                 "agents/vscode.svg",
                 "agents/vscode-agents-copilot.svg",
                 "agents/vscode-agents-claude.svg",
@@ -112,11 +157,6 @@ mod tests {
                         assert!(svg.contains("<path"));
                         assert!(!svg.contains("<image"));
                     }
-                    // A glyph is tinted through its alpha, so it must not carry a background.
-                    if agent_icon_is_glyph(agent) {
-                        assert!(!svg.contains("<rect"));
-                        assert_eq!(svg.matches("<path").count(), 1);
-                    }
                 }
                 assert!(
                     Assets
@@ -127,10 +167,9 @@ mod tests {
                 );
             }
         }
-        assert_ne!(
-            agent_icon("vscode-agents-codex", false),
-            agent_icon("vscode-agents-codex", true)
-        );
+        for agent in ["codex", "vscode-agents-codex"] {
+            assert_ne!(agent_icon(agent, false), agent_icon(agent, true));
+        }
         assert!(Assets.load("icons/check.svg").unwrap().is_some());
     }
 }
