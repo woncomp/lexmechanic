@@ -16,3 +16,4 @@ unicode-normalization = "0.1"
 unicode-segmentation = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 tempfile = "3"
+ruzstd = "0.9"

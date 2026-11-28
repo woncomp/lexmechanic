@@ -8,6 +8,9 @@ pub fn agent_icon(agent: &str) -> Option<&'static str> {
         "copilot-cli" => Some("agents/copilot-cli.svg"),
         "copilot-app" => Some("agents/copilot-app.png"),
         "vscode" => Some("agents/vscode.svg"),
+        "vscode-agents-copilot" => Some("agents/vscode-agents-copilot.svg"),
+        "vscode-agents-claude" => Some("agents/vscode-agents-claude.svg"),
+        "vscode-agents-codex" => Some("agents/vscode-agents-codex.svg"),
         _ => None,
     }
 }
@@ -22,6 +25,15 @@ impl AssetSource for Assets {
                 Some(include_bytes!("../../../assets/agents/copilot-app.png"))
             }
             "agents/vscode.svg" => Some(include_bytes!("../../../assets/agents/vscode.svg")),
+            "agents/vscode-agents-copilot.svg" => Some(include_bytes!(
+                "../../../assets/agents/vscode-agents-copilot.svg"
+            )),
+            "agents/vscode-agents-claude.svg" => Some(include_bytes!(
+                "../../../assets/agents/vscode-agents-claude.svg"
+            )),
+            "agents/vscode-agents-codex.svg" => Some(include_bytes!(
+                "../../../assets/agents/vscode-agents-codex.svg"
+            )),
             _ => None,
         };
         match bytes {
@@ -37,6 +49,9 @@ impl AssetSource for Assets {
                 "agents/copilot-cli.svg",
                 "agents/copilot-app.png",
                 "agents/vscode.svg",
+                "agents/vscode-agents-copilot.svg",
+                "agents/vscode-agents-claude.svg",
+                "agents/vscode-agents-codex.svg",
             ]
             .into_iter()
             .filter(|name| name.starts_with(path))
@@ -52,7 +67,14 @@ mod tests {
 
     #[test]
     fn agent_icons_and_component_icons_are_bundled_without_runtime_file_paths() {
-        for agent in ["copilot-cli", "copilot-app", "vscode"] {
+        for agent in [
+            "copilot-cli",
+            "copilot-app",
+            "vscode",
+            "vscode-agents-copilot",
+            "vscode-agents-claude",
+            "vscode-agents-codex",
+        ] {
             let path = agent_icon(agent).unwrap();
             let bytes = Assets.load(path).unwrap().unwrap();
             if path.ends_with(".png") {
@@ -60,7 +82,8 @@ mod tests {
             } else {
                 let svg = std::str::from_utf8(&bytes).unwrap();
                 assert!(svg.contains("<svg"));
-                if agent == "copilot-cli" {
+                // Vector-only: the app must not depend on embedded bitmaps for these icons.
+                if agent == "copilot-cli" || agent.starts_with("vscode-agents-") {
                     assert!(svg.contains("<path"));
                     assert!(!svg.contains("<image"));
                     assert!(!svg.contains("data:image/"));

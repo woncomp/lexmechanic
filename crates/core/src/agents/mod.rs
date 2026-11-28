@@ -1,6 +1,8 @@
 pub mod copilot_app;
 pub mod copilot_cli;
+mod jsonl;
 pub mod vscode;
+pub mod vscode_agents;
 
 use crate::model::{
     Cancellation, Candidate, Discovery, Message, ReadBatch, ReadMode, Session, SessionKey, Source,
@@ -19,6 +21,9 @@ pub fn adapter_for(candidate: &Candidate) -> anyhow::Result<Arc<dyn AgentAdapter
         "copilot-cli" => Ok(Arc::new(copilot_cli::CopilotCli::for_candidate(candidate)?)),
         "copilot-app" => Ok(Arc::new(copilot_app::CopilotApp::for_candidate(candidate)?)),
         "vscode" => Ok(Arc::new(vscode::VsCode::for_candidate(candidate)?)),
+        agent if vscode_agents::Driver::from_agent(agent).is_some() => Ok(Arc::new(
+            vscode_agents::VsCodeAgents::for_candidate(candidate)?,
+        )),
         _ => anyhow::bail!("This agent provider is not installed"),
     }
 }
@@ -28,6 +33,9 @@ pub fn agent_name(id: &str) -> &str {
         "copilot-cli" => "Copilot CLI",
         "copilot-app" => "Copilot App",
         "vscode" => "VS Code",
+        "vscode-agents-copilot" => "VS Code Agents - Copilot",
+        "vscode-agents-codex" => "VS Code Agents - Codex",
+        "vscode-agents-claude" => "VS Code Agents - Claude",
         _ => id,
     }
 }

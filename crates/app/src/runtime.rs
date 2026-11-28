@@ -1,6 +1,12 @@
 use crate::persistence::{self, Settings};
 use agent_chat_reader_core::{
-    agents::{AgentAdapter, copilot_app::CopilotApp, copilot_cli::CopilotCli, vscode::VsCode},
+    agents::{
+        AgentAdapter,
+        copilot_app::CopilotApp,
+        copilot_cli::CopilotCli,
+        vscode::VsCode,
+        vscode_agents::{self, Driver, Homes, VsCodeAgents},
+    },
     model::*,
     scan::{self, ScanEvent, SharedWriter},
     search::{SearchCursor, SearchHit, SearchQuery},
@@ -646,21 +652,40 @@ fn begin_scan(
     }
     let vscode_roots = match vscode_sources {
         Some(roots) => roots.to_vec(),
-        None => vec![agent_chat_reader_core::agents::vscode::default_user_root()?],
+        None => agent_chat_reader_core::agents::vscode::default_user_roots()?,
     };
+    let mut vscode_adapters: Vec<Result<Arc<dyn AgentAdapter>>> = Vec::new();
+    let mut agent_homes = None;
     for root in vscode_roots {
-        if vscode_sources.is_none()
-            && !agent_chat_reader_core::agents::vscode::session_store(&root).is_file()
+        if vscode_sources.is_some()
+            || agent_chat_reader_core::agents::vscode::session_store(&root).is_file()
         {
-            continue;
+            vscode_adapters
+                .push(VsCode::new(&root).map(|adapter| Arc::new(adapter) as Arc<dyn AgentAdapter>));
         }
-        match VsCode::new(&root) {
+        // The Agents window keeps its own catalog; the drivers' transcripts live elsewhere.
+        if vscode_agents::catalog_path(&root).is_file() {
+            match agent_homes.get_or_insert_with(Homes::detect) {
+                Ok(homes) => {
+                    for driver in Driver::ALL {
+                        vscode_adapters.push(
+                            VsCodeAgents::new(&root, driver, homes.clone())
+                                .map(|adapter| Arc::new(adapter) as Arc<dyn AgentAdapter>),
+                        );
+                    }
+                }
+                Err(error) => emit(sender, Event::Error(format!("{error:#}")), stop)?,
+            }
+        }
+    }
+    for adapter in vscode_adapters {
+        match adapter {
             Ok(adapter)
                 if !adapters
                     .iter()
                     .any(|existing| existing.source().id == adapter.source().id) =>
             {
-                adapters.push(Arc::new(adapter))
+                adapters.push(adapter)
             }
             Ok(_) => {}
             Err(error) => emit(sender, Event::Error(format!("{error:#}")), stop)?,

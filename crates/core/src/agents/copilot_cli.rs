@@ -58,6 +58,11 @@ impl WorkspaceMetadata {
     fn originated_in_cli(&self) -> bool {
         self.client_name.as_deref() == Some("github/cli")
     }
+
+    /// True when this adapter would list the session; the VS Code Agents adapter takes the rest.
+    pub(super) fn claimed_by_cli(&self) -> bool {
+        self.continued_in_cli() || self.originated_in_cli()
+    }
 }
 
 #[derive(Deserialize)]
@@ -96,7 +101,7 @@ impl CopilotCli {
     }
 }
 
-fn visible_content(raw: &str) -> String {
+pub(super) fn visible_content(raw: &str) -> String {
     // Only strip complete, known wrappers. Preserve user text following a wrapper.
     let mut content = raw.trim_start_matches('\u{feff}').to_owned();
     loop {

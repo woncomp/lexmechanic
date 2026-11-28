@@ -13,7 +13,7 @@ use std::{
 
 const SESSION_INDEX_KEY: &str = "chat.ChatSessionStore.index";
 
-pub fn default_user_root() -> Result<PathBuf> {
+fn user_root_of(product: &str) -> Result<PathBuf> {
     let roaming = std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .or_else(|| {
@@ -21,7 +21,19 @@ pub fn default_user_root() -> Result<PathBuf> {
                 .map(|home| PathBuf::from(home).join("AppData").join("Roaming"))
         })
         .context("Cannot locate VS Code user data; select its User directory")?;
-    Ok(roaming.join("Code").join("User"))
+    Ok(roaming.join(product).join("User"))
+}
+
+pub fn default_user_root() -> Result<PathBuf> {
+    user_root_of("Code")
+}
+
+/// Stable and Insiders keep separate user data; either may be absent.
+pub fn default_user_roots() -> Result<Vec<PathBuf>> {
+    Ok(vec![
+        user_root_of("Code")?,
+        user_root_of("Code - Insiders")?,
+    ])
 }
 
 pub fn session_store(root: &Path) -> PathBuf {

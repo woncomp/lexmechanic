@@ -366,7 +366,8 @@ impl Workbench {
             show_settings: false,
             show_diagnostics: false,
             diagnostics: Vec::new(),
-            status: "Discovering Copilot CLI, Copilot App and VS Code sessions…".into(),
+            status: "Discovering Copilot CLI, Copilot App, VS Code and VS Code Agents sessions…"
+                .into(),
             progress: HashMap::new(),
             catalog_run: 0,
             search_state: String::new(),
@@ -1574,7 +1575,9 @@ impl Workbench {
                     div()
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
-                        .child("Local only · Read-only · Copilot CLI / App / VS Code"),
+                        .child(
+                            "Local only · Read-only · Copilot CLI / App / VS Code / VS Code Agents",
+                        ),
                 )
                 .into_any_element();
         };
@@ -2112,7 +2115,9 @@ impl Workbench {
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child(match &self.settings.vscode_sources {
-                        None => "VS Code: %APPDATA%\\Code\\User".to_owned(),
+                        None => {
+                            "VS Code: %APPDATA%\\Code\\User and Code - Insiders\\User".to_owned()
+                        }
                         Some(roots) => format!(
                             "VS Code: {}",
                             roots
