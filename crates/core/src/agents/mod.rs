@@ -43,6 +43,19 @@ pub fn agent_name(id: &str) -> &str {
     }
 }
 
+/// The agent of a source id made by [`source`]: a bare digest for Copilot CLI, otherwise
+/// `{agent}-{digest}`.
+pub fn source_agent(id: &str) -> &str {
+    let is_digest = |value: &str| value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit());
+    if is_digest(id) {
+        return "copilot-cli";
+    }
+    match id.rsplit_once('-') {
+        Some((agent, digest)) if is_digest(digest) => agent,
+        _ => id,
+    }
+}
+
 pub(super) fn source(root: &Path, agent: &str) -> Result<Source> {
     let root = std::fs::canonicalize(root).with_context(|| {
         format!(
@@ -139,5 +152,21 @@ pub trait AgentAdapter: Send + Sync + 'static {
         _message: &Message,
     ) -> anyhow::Result<String> {
         anyhow::bail!("This agent does not support original-text viewing")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::source_agent;
+
+    #[test]
+    fn source_ids_name_their_agent() {
+        let digest = "a".repeat(64);
+        assert_eq!(source_agent(&digest), "copilot-cli");
+        assert_eq!(
+            source_agent(&format!("vscode-agents-claude-{digest}")),
+            "vscode-agents-claude"
+        );
+        assert_eq!(source_agent("custom"), "custom");
     }
 }

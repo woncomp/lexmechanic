@@ -31,6 +31,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "index_status.rs"]
+pub(crate) mod index_status;
 #[path = "message_rail.rs"]
 pub(crate) mod message_rail;
 #[path = "search_results.rs"]
@@ -145,6 +147,8 @@ pub struct Workbench {
     status: String,
     progress: HashMap<String, ScanProgress>,
     catalog_run: u64,
+    /// Whether the latest catalog run has finished scanning and indexing.
+    catalog_done: bool,
     search_state: String,
     active_query: Option<SearchQuery>,
     finished: HashSet<String>,
@@ -398,6 +402,7 @@ impl Workbench {
                     .into(),
             progress: HashMap::new(),
             catalog_run: 0,
+            catalog_done: false,
             search_state: String::new(),
             active_query: None,
             finished: HashSet::new(),
@@ -482,6 +487,7 @@ impl Workbench {
                 Event::CatalogStarted { run_id } => {
                     if run_id >= self.catalog_run {
                         self.catalog_run = run_id;
+                        self.catalog_done = false;
                         self.progress.clear();
                         self.finished.clear();
                     }
@@ -566,6 +572,7 @@ impl Workbench {
                     self.finished.insert(source);
                 }
                 Event::CatalogFinished { run_id } if run_id == self.catalog_run => {
+                    self.catalog_done = true;
                     self.status = if self.diagnostics.is_empty() {
                         "Ready · local main conversations · newest modified sessions scanned first"
                             .into()
@@ -962,6 +969,7 @@ impl Workbench {
         self.sessions.clear();
         self.progress.clear();
         self.finished.clear();
+        self.catalog_done = false;
         self.hits.clear();
         self.rebuild_search_rows();
         self.restore_pending = self.tabs.active.clone();
@@ -2560,29 +2568,7 @@ impl Render for Workbench {
                 )
                 .into_any_element()
         };
-        let mut totals = ScanProgress::default();
-        for progress in self.progress.values() {
-            totals.discovered += progress.discovered;
-            totals.scanned += progress.scanned;
-            totals.indexable += progress.indexable;
-            totals.indexed += progress.indexed;
-            totals.unreadable += progress.unreadable;
-            totals.failed += progress.failed;
-        }
-        let index_status = if totals.discovered > 0 {
-            format!(
-                "{} sessions · scanned {}/{} · indexed {}/{} · unreadable {} · failed {}",
-                self.sessions.len(),
-                totals.scanned,
-                totals.discovered,
-                totals.indexed,
-                totals.indexable,
-                totals.unreadable,
-                totals.failed,
-            )
-        } else {
-            format!("{} sessions", self.sessions.len())
-        };
+        let index_button = self.render_index_button(cx);
         let search_status = if !self.search_state.is_empty() {
             Some(self.search_state.clone())
         } else if self.search_mode {
@@ -2865,13 +2851,6 @@ impl Render for Workbench {
                     .border_color(cx.theme().border)
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(
-                        div()
-                            .id("index-progress")
-                            .role(gpui_kit::Role::Status)
-                            .aria_label(index_status.clone())
-                            .child(index_status),
-                    )
                     .when_some(search_status, |bar, search_status| {
                         bar.child(
                             div()
@@ -2898,7 +2877,8 @@ impl Render for Workbench {
                                 this.show_diagnostics = !this.show_diagnostics;
                                 cx.notify();
                             })),
-                    ),
+                    )
+                    .child(index_button),
             )
     }
 }
