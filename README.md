@@ -96,7 +96,7 @@ GPUI Kit 与其匹配的 GPUI snapshot 由版本及 `Cargo.lock` 锁定；不要
 - 正文/渲染状态有字节预算和实体数量限制，切换标签释放旧渲染状态。SQLite FTS5 trigram 缩小较长查询候选；短词采用可取消的精确扫描。旧请求不能覆盖新选择。
 - 追加解析只消费本次捕获文件长度内的新完整记录；半条 JSON 不会提前越过索引游标，也不会让搜索永久等待。文件截断、替换或检查点不一致在下一次用户操作中重建相应会话；中间坏行保留明确诊断，其他会话继续可用。
 - VS Code 的快照重放在后台按行读取并支持取消，最多保留一个已重放的会话，不将全部历史状态常驻内存；单个 VS Code 会话仍需还原完整状态，内存开销与该会话大小相关。
-- `assets\agents` 中的图标嵌入可执行文件；Copilot CLI 使用由提供的 Icons8 PNG 矢量重绘的 `copilot-cli.svg`，保留紫蓝渐变与青色细节，不内嵌位图。Copilot App 保持 PNG，VS Code 使用 SVG；VS Code Agents - Copilot / Claude 的图标（`vscode-agents-{copilot,claude}.svg`）为 Agents 立方体加右下角驱动标识，均为纯矢量。Codex 与 VS Code Agents - Codex 各有浅色、深色两份图标（`codex-{light,dark}.svg`、`vscode-agents-codex-{light,dark}.svg`），按当前主题选用：Codex 为 OpenAI 标志，浅色主题为黑色、深色主题为白色；VS Code Agents - Codex 内嵌 PNG，并叠加随主题反色的 OpenAI 标志；发行包不依赖原始图标路径。
+- `assets\agents` 中的图标嵌入可执行文件；Copilot App 保持 PNG，VS Code 使用 SVG。Copilot CLI、Codex、VS Code Agents - Copilot 与 VS Code Agents - Codex 各有浅色、深色两份图标，按当前主题选用；VS Code Agents 图标以对应驱动标识为主体，右下角叠加矢量 Sessions 标识，Claude 使用单份图标。发行包不依赖原始图标路径。
 - 可重建索引使用 SQLite WAL / NORMAL：事务中的正文、FTS 与游标保持原子一致，断电时尚未持久化的索引进度允许从原始日志重新生成；不以此降低原始数据或设置文件的持久化要求。
 
 ### 合成数据验证

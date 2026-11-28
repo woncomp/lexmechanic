@@ -50,12 +50,14 @@ pub fn icon_source(path: &'static str, logical: f32) -> ImageSource {
 /// The icon for an agent; a few have separate artwork for the dark theme.
 pub fn agent_icon(agent: &str, dark: bool) -> Option<&'static str> {
     match agent {
-        "copilot-cli" => Some("agents/copilot-cli.svg"),
+        "copilot-cli" if dark => Some("agents/copilot-cli-dark.svg"),
+        "copilot-cli" => Some("agents/copilot-cli-light.svg"),
         "copilot-app" => Some("agents/copilot-app.png"),
         "codex" if dark => Some("agents/codex-dark.svg"),
         "codex" => Some("agents/codex-light.svg"),
         "vscode" => Some("agents/vscode.svg"),
-        "vscode-agents-copilot" => Some("agents/vscode-agents-copilot.svg"),
+        "vscode-agents-copilot" if dark => Some("agents/vscode-agents-copilot-dark.svg"),
+        "vscode-agents-copilot" => Some("agents/vscode-agents-copilot-light.svg"),
         "vscode-agents-claude" => Some("agents/vscode-agents-claude.svg"),
         "vscode-agents-codex" if dark => Some("agents/vscode-agents-codex-dark.svg"),
         "vscode-agents-codex" => Some("agents/vscode-agents-codex-light.svg"),
@@ -66,9 +68,12 @@ pub fn agent_icon(agent: &str, dark: bool) -> Option<&'static str> {
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> anyhow::Result<Option<Cow<'static, [u8]>>> {
         let bytes: Option<&'static [u8]> = match path {
-            "agents/copilot-cli.svg" => {
-                Some(include_bytes!("../../../assets/agents/copilot-cli.svg"))
-            }
+            "agents/copilot-cli-light.svg" => Some(include_bytes!(
+                "../../../assets/agents/copilot-cli-light.svg"
+            )),
+            "agents/copilot-cli-dark.svg" => Some(include_bytes!(
+                "../../../assets/agents/copilot-cli-dark.svg"
+            )),
             "agents/copilot-app.png" => {
                 Some(include_bytes!("../../../assets/agents/copilot-app.png"))
             }
@@ -79,8 +84,11 @@ impl AssetSource for Assets {
                 Some(include_bytes!("../../../assets/agents/codex-dark.svg"))
             }
             "agents/vscode.svg" => Some(include_bytes!("../../../assets/agents/vscode.svg")),
-            "agents/vscode-agents-copilot.svg" => Some(include_bytes!(
-                "../../../assets/agents/vscode-agents-copilot.svg"
+            "agents/vscode-agents-copilot-light.svg" => Some(include_bytes!(
+                "../../../assets/agents/vscode-agents-copilot-light.svg"
+            )),
+            "agents/vscode-agents-copilot-dark.svg" => Some(include_bytes!(
+                "../../../assets/agents/vscode-agents-copilot-dark.svg"
             )),
             "agents/vscode-agents-claude.svg" => Some(include_bytes!(
                 "../../../assets/agents/vscode-agents-claude.svg"
@@ -103,12 +111,14 @@ impl AssetSource for Assets {
         let mut paths = gpui_kit::assets::Assets.list(path)?;
         paths.extend(
             [
-                "agents/copilot-cli.svg",
+                "agents/copilot-cli-light.svg",
+                "agents/copilot-cli-dark.svg",
                 "agents/copilot-app.png",
                 "agents/codex-light.svg",
                 "agents/codex-dark.svg",
                 "agents/vscode.svg",
-                "agents/vscode-agents-copilot.svg",
+                "agents/vscode-agents-copilot-light.svg",
+                "agents/vscode-agents-copilot-dark.svg",
                 "agents/vscode-agents-claude.svg",
                 "agents/vscode-agents-codex-light.svg",
                 "agents/vscode-agents-codex-dark.svg",
@@ -167,7 +177,12 @@ mod tests {
                 );
             }
         }
-        for agent in ["codex", "vscode-agents-codex"] {
+        for agent in [
+            "copilot-cli",
+            "codex",
+            "vscode-agents-copilot",
+            "vscode-agents-codex",
+        ] {
             assert_ne!(agent_icon(agent, false), agent_icon(agent, true));
         }
         assert!(Assets.load("icons/check.svg").unwrap().is_some());
