@@ -650,13 +650,11 @@ impl Workbench {
                         self.status = "Search result changed; run the search again".into();
                     }
                     let owner = cx.weak_entity();
-                    document.list.set_scroll_handler(move |event, _, cx| {
+                    document.list.set_scroll_handler(move |_, _, cx| {
                         let _ = owner.update(cx, |this, cx| {
-                            if let Some(document) = &mut this.document
-                                && let Some(row) = document.rows.get(event.visible_range.start)
-                            {
-                                document.current = row.message;
-                                document.follow_current();
+                            // ListState is borrowed during this callback; resolve on next render.
+                            if let Some(document) = &mut this.document {
+                                document.sync_current = true;
                             }
                             this.save_due = Some(Instant::now() + Duration::from_secs(1));
                             cx.notify();
@@ -1571,6 +1569,9 @@ impl Workbench {
                     .size_full(),
                 )
                 .into_any_element();
+        }
+        if let Some(document) = &mut self.document {
+            document.sync_current_from_scroll();
         }
         let Some(document) = &self.document else {
             return v_flex()
