@@ -14,6 +14,13 @@ fn marker_width(current: bool, hovered: bool, focused: bool) -> f32 {
     }
 }
 
+pub(super) fn role_accent(role: Role) -> Rgba {
+    match role {
+        Role::User => rgb(0xff9800),
+        Role::Assistant => rgb(0x00bcd4),
+    }
+}
+
 fn marker_background(
     role: Role,
     current: bool,
@@ -21,10 +28,7 @@ fn marker_background(
     assistant_color: Hsla,
     background: Hsla,
 ) -> Background {
-    let accent = match role {
-        Role::User => rgb(0xff9800),
-        Role::Assistant => rgb(0x00bcd4),
-    };
+    let accent = role_accent(role);
     if current {
         return accent.into();
     }

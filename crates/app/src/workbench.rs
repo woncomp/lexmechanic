@@ -1324,6 +1324,8 @@ impl Workbench {
         );
         let range = message.parts[part].clone();
         let segmented = message.parts.len() > 1;
+        let last_part = collapsed || part + 1 == message.parts.len();
+        let reading = row.message == document.current;
         let attachments = message.attachment_names.clone();
         let preview = message.info.preview.clone();
         document.tick += 1;
@@ -1415,6 +1417,7 @@ impl Workbench {
         };
         let mut card = v_flex()
             .id(("message-part", index))
+            .relative()
             .w_full()
             .p_5()
             .gap_3()
@@ -1423,7 +1426,18 @@ impl Workbench {
             .border_color(cx.theme().border)
             .when(role == Role::User, |card| {
                 card.bg(cx.theme().muted.opacity(0.35))
-            });
+            })
+            .child(
+                div()
+                    .absolute()
+                    // Clear the panel divider hairline, which paints over the panel's first pixel.
+                    .left_1()
+                    // Segments of one message keep a continuous bar; 3px + 3px gap between messages.
+                    .top(px(if part == 0 { 3. } else { 0. }))
+                    .bottom(px(if last_part { 3. } else { 0. }))
+                    .w(px(if reading { 2. } else { 1. }))
+                    .bg(message_rail::role_accent(role)),
+            );
         if part == 0 {
             card = card.child(
                 h_flex()
