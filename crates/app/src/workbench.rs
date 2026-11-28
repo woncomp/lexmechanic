@@ -16,6 +16,7 @@ use gpui_kit::{
         input::{Input, InputEvent, InputState},
         menu::{ContextMenuExt, DropdownMenu, PopupMenuItem},
         resizable::{ResizableState, h_resizable, resizable_panel},
+        scroll::ScrollableElement,
         table::{DataTable, TableEvent, TableState},
         text::{RangeHighlight, TextView, TextViewState},
         *,
@@ -32,6 +33,10 @@ use std::{
 
 #[path = "message_rail.rs"]
 pub(crate) mod message_rail;
+#[path = "search_results.rs"]
+pub(crate) mod search_results;
+
+use search_results::{SearchRow, SearchScroll};
 
 actions!(
     reader,
@@ -125,6 +130,13 @@ pub struct Workbench {
     hits_complete: bool,
     more_hits: Option<SearchCursor>,
     hit_index: usize,
+    hit_sessions: usize,
+    hit_totals: HashMap<String, usize>,
+    search_rows: Vec<SearchRow>,
+    search_scroll: SearchScroll,
+    collapsed_groups: HashSet<String>,
+    /// The session of the last hit on the previous page, whose group may carry over.
+    page_tail: Option<String>,
     search_mode: bool,
     find_visible: bool,
     show_settings: bool,
@@ -370,6 +382,12 @@ impl Workbench {
             hits_complete: true,
             more_hits: None,
             hit_index: 0,
+            hit_sessions: 0,
+            hit_totals: HashMap::new(),
+            search_rows: Vec::new(),
+            search_scroll: SearchScroll::new(),
+            collapsed_groups: HashSet::new(),
+            page_tail: None,
             search_mode: false,
             find_visible: false,
             show_settings: false,
@@ -733,11 +751,16 @@ impl Workbench {
                     generation,
                     hits,
                     scanned,
+                    sessions,
+                    totals,
                     complete,
                     more,
                 } if generation == self.query_generation => {
                     self.hits.extend(hits);
                     self.hits_scanned = scanned;
+                    self.hit_sessions = sessions;
+                    self.hit_totals.extend(totals);
+                    self.rebuild_search_rows();
                     self.hits_complete = complete;
                     self.more_hits = more;
                     self.search_state.clear();
@@ -940,6 +963,7 @@ impl Workbench {
         self.progress.clear();
         self.finished.clear();
         self.hits.clear();
+        self.rebuild_search_rows();
         self.restore_pending = self.tabs.active.clone();
         self.table.update(cx, |table, cx| {
             table.delegate_mut().rows.clear();
@@ -961,6 +985,7 @@ impl Workbench {
         self.hits_complete = false;
         self.more_hits = None;
         self.hit_index = usize::MAX;
+        self.rebuild_search_rows();
         self.search_state = "准备搜索…".into();
         cx.notify();
     }
@@ -975,6 +1000,11 @@ impl Workbench {
         self.search_mode = !self.query_local && !self.query_text.is_empty();
         self.hits.clear();
         self.hits_scanned = 0;
+        self.hit_sessions = 0;
+        self.hit_totals.clear();
+        self.collapsed_groups.clear();
+        self.page_tail = None;
+        self.rebuild_search_rows();
         self.hits_complete = self.query_text.is_empty();
         if self.query_text.is_empty() {
             return;
@@ -1073,8 +1103,11 @@ impl Workbench {
 
     fn next_search_page(&mut self, cx: &mut Context<Self>) {
         if let Some(cursor) = self.more_hits.take() {
+            self.page_tail = self.hits.last().map(|hit| hit.session.clone());
             self.hits.clear();
+            self.hit_totals.clear();
             self.hit_index = usize::MAX;
+            self.rebuild_search_rows();
             self.send_search(cursor);
             cx.notify();
         }
@@ -1091,6 +1124,9 @@ impl Workbench {
         } else {
             (self.hit_index + 1) % self.hits.len()
         };
+        if self.search_mode {
+            self.reveal_search_hit(self.hit_index);
+        }
         let hit = self.hits[self.hit_index].clone();
         self.open_hit(hit, false, window, cx);
     }
@@ -1845,7 +1881,7 @@ impl Workbench {
     }
 
     fn render_search(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let count = self.hits.len();
+        let owner = cx.entity();
         v_flex()
             .size_full()
             .min_h_0()
@@ -1865,16 +1901,20 @@ impl Workbench {
                                 cx.notify();
                             })),
                     )
-                    .child(format!(
-                        "{count} hits{} · main conversations",
-                        if self.hits_complete {
-                            ""
-                        } else if self.more_hits.is_some() {
-                            " (more available)"
-                        } else {
-                            " (searching…)"
-                        }
-                    ))
+                    .child(if !self.hits_complete && self.more_hits.is_none() {
+                        "Searching…".to_owned()
+                    } else {
+                        format!(
+                            "{} matches in {} sessions{}",
+                            self.hits_scanned,
+                            self.hit_sessions,
+                            if self.more_hits.is_some() {
+                                " · more on the next page"
+                            } else {
+                                ""
+                            }
+                        )
+                    })
                     .when(self.more_hits.is_some(), |row| {
                         row.child(
                             Button::new("search-more")
@@ -1958,84 +1998,20 @@ impl Workbench {
             )
             .child(
                 div()
-                    .px_3()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(if self.search_state.is_empty() {
-                        "搜索结果已固定；按 Enter 重新检查已有会话并搜索。".to_owned()
-                    } else {
-                        self.search_state.clone()
-                    }),
-            )
-            .child(
-                uniform_list(
-                    "search-results",
-                    count,
-                    cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
-                        range
-                            .map(|index| {
-                                let hit = this.hits[index].clone();
-                                let session = this.sessions.get(&hit.session);
-                                let title = if hit.session_name.is_empty() {
-                                    session
-                                        .map(|session| session.name.clone())
-                                        .unwrap_or_else(|| "Session".into())
-                                } else {
-                                    hit.session_name.clone()
-                                };
-                                let is_title = hit.kind == HitKind::Title;
-                                let detail = if is_title {
-                                    String::new()
-                                } else {
-                                    hit.snippet.clone()
-                                };
-                                v_flex()
-                                    .id(("search-hit", index))
-                                    .p_3()
-                                    .gap_1()
-                                    .h(px(116.))
-                                    .overflow_hidden()
-                                    .border_b_1()
-                                    .border_color(cx.theme().border)
-                                    .cursor_pointer()
-                                    .hover(|style| style.bg(cx.theme().muted))
-                                    .child(
-                                        div()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_sm()
-                                            .child(title),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(if is_title {
-                                                "Title match".to_owned()
-                                            } else {
-                                                format!(
-                                                    "#{} · {}",
-                                                    hit.ordinal + 1,
-                                                    hit.role.label()
-                                                )
-                                            }),
-                                    )
-                                    .when(!is_title, |row| row.child(div().text_sm().child(detail)))
-                                    .on_click(cx.listener(
-                                        move |this, event: &ClickEvent, window, cx| {
-                                            this.open_hit(
-                                                hit.clone(),
-                                                event.click_count() >= 2,
-                                                window,
-                                                cx,
-                                            )
-                                        },
-                                    ))
-                            })
-                            .collect()
-                    }),
-                )
-                .h_full()
-                .w_full(),
+                    .id("search-results")
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        list(self.search_scroll.list.clone(), move |index, _, cx| {
+                            owner.update(cx, |this, cx| this.render_search_row(index, cx))
+                        })
+                        .size_full(),
+                    )
+                    .vertical_scrollbar(&self.search_scroll),
             )
             .into_any_element()
     }
@@ -2607,6 +2583,13 @@ impl Render for Workbench {
         } else {
             format!("{} sessions", self.sessions.len())
         };
+        let search_status = if !self.search_state.is_empty() {
+            Some(self.search_state.clone())
+        } else if self.search_mode {
+            Some("搜索结果已固定；按 Enter 重新检查已有会话并搜索。".to_owned())
+        } else {
+            None
+        };
         v_flex()
             .id("agent-chat-reader")
             .key_context("Lexmechanic")
@@ -2889,6 +2872,16 @@ impl Render for Workbench {
                             .aria_label(index_status.clone())
                             .child(index_status),
                     )
+                    .when_some(search_status, |bar, search_status| {
+                        bar.child(
+                            div()
+                                .id("search-progress")
+                                .flex_shrink_0()
+                                .role(gpui_kit::Role::Status)
+                                .aria_label(search_status.clone())
+                                .child(search_status),
+                        )
+                    })
                     .child(
                         div()
                             .flex_1()

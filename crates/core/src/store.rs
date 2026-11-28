@@ -550,46 +550,7 @@ impl Store {
     /// Session titles live in the session record rather than the FTS index, so they are matched
     /// in memory. Titles have no role and are not part of a single-document find.
     pub fn title_hits(&self, query: &SearchQuery, cancel: &Cancellation) -> Result<Vec<SearchHit>> {
-        if query.session.is_some() || query.role.is_some() {
-            return Ok(Vec::new());
-        }
-        let mut hits = Vec::new();
-        for session in self.sessions(query.mode)? {
-            cancel.check()?;
-            let key = session.candidate.key.storage_key();
-            if !session.available
-                || !session.indexed
-                || query
-                    .members
-                    .as_ref()
-                    .is_some_and(|members| !members.contains(&key))
-                || query
-                    .workspace
-                    .as_ref()
-                    .is_some_and(|workspace| session.workspace.as_ref() != Some(workspace))
-                || query
-                    .since
-                    .is_some_and(|since| session.time(query.mode).is_none_or(|time| time < since))
-            {
-                continue;
-            }
-            let Some(range) = first_range(&session.name, &query.text) else {
-                continue;
-            };
-            hits.push(SearchHit {
-                session: key,
-                message_id: 0,
-                ordinal: 0,
-                role: Role::User,
-                snippet: session.name.clone(),
-                offset: range.start,
-                session_name: session.name,
-                workspace: session.workspace,
-                document_snapshot: false,
-                kind: HitKind::Title,
-            });
-        }
-        Ok(hits)
+        title_hits(self.sessions(query.mode)?, query, cancel)
     }
 
     pub fn search_page(
@@ -784,4 +745,52 @@ fn checkpoint_hashes(path: &PathBuf, cursor: u64) -> Result<(Vec<u8>, Vec<u8>)> 
         Sha256::digest(prefix).to_vec(),
         Sha256::digest(boundary).to_vec(),
     ))
+}
+
+/// Matches titles over a session list that is already in result order.
+pub(crate) fn title_hits(
+    sessions: Vec<Session>,
+    query: &SearchQuery,
+    cancel: &Cancellation,
+) -> Result<Vec<SearchHit>> {
+    if query.session.is_some() || query.role.is_some() {
+        return Ok(Vec::new());
+    }
+    let mut hits = Vec::new();
+    for session in sessions {
+        cancel.check()?;
+        let key = session.candidate.key.storage_key();
+        if !session.available
+            || !session.indexed
+            || query
+                .members
+                .as_ref()
+                .is_some_and(|members| !members.contains(&key))
+            || query
+                .workspace
+                .as_ref()
+                .is_some_and(|workspace| session.workspace.as_ref() != Some(workspace))
+            || query
+                .since
+                .is_some_and(|since| session.time(query.mode).is_none_or(|time| time < since))
+        {
+            continue;
+        }
+        let Some(range) = first_range(&session.name, &query.text) else {
+            continue;
+        };
+        hits.push(SearchHit {
+            session: key,
+            message_id: 0,
+            ordinal: 0,
+            role: Role::User,
+            snippet: session.name.clone(),
+            offset: range.start,
+            session_name: session.name,
+            workspace: session.workspace,
+            document_snapshot: false,
+            kind: HitKind::Title,
+        });
+    }
+    Ok(hits)
 }

@@ -87,6 +87,10 @@ pub enum Event {
         generation: u64,
         hits: Vec<SearchHit>,
         scanned: usize,
+        /// Sessions with at least one hit across all pages.
+        sessions: usize,
+        /// Message-hit totals across all pages for each session on this page.
+        totals: HashMap<String, usize>,
         complete: bool,
         more: Option<SearchCursor>,
     },
@@ -884,12 +888,15 @@ fn send_page(
     stop: &Cancellation,
 ) -> Result<()> {
     let (hits, next) = snapshot.page(offset)?;
+    let totals = snapshot.totals(&hits)?;
     emit(
         sender,
         Event::Hits {
             generation,
             hits,
             scanned: snapshot.count,
+            sessions: snapshot.sessions,
+            totals,
             complete: next.is_none(),
             more: next.map(|offset| SearchCursor {
                 offset,

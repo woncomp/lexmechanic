@@ -143,7 +143,7 @@ impl SessionTable {
         Self::date_label(session, self.mode)
     }
 
-    fn date_label(session: &Session, mode: TimeMode) -> String {
+    pub fn date_label(session: &Session, mode: TimeMode) -> String {
         session
             .time(mode)
             .map(|time| time.with_timezone(&Local).format("%m-%d").to_string())

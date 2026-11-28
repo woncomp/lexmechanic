@@ -706,7 +706,7 @@ fn title_search_matches_session_names_before_content_and_honors_filters() {
         assert!(store.title_hits(query, &cancel).unwrap().is_empty());
     }
 
-    // The snapshot lists title hits ahead of the content hits of the same query.
+    // The snapshot lists a session's title hit ahead of its content hits.
     let directory = tempfile::tempdir().unwrap();
     let snapshot = store
         .with_read_snapshot(|source| {
@@ -726,4 +726,59 @@ fn hits_without_a_kind_deserialize_as_message_hits() {
     }))
     .unwrap();
     assert_eq!(hit.kind, HitKind::Message);
+}
+
+#[test]
+fn search_snapshot_groups_title_and_message_hits_in_session_order() {
+    let fixture = Fixture::new();
+    let mut store = Store::open(&fixture.database).unwrap();
+    let mut index = |native: &str, name: &str, time: &str, body: &str| {
+        let candidate = fixture.session(native, &[start(), msg("user.message", time, body)]);
+        let mut session = fixture.index(&mut store, &candidate);
+        session.name = name.into();
+        store.upsert_session(&session).unwrap();
+        candidate.key.storage_key()
+    };
+    let old = index(
+        A,
+        "Older work",
+        "2026-01-01T01:00:00Z",
+        "a needle in old text",
+    );
+    let titled = index(B, "Needle plan", "2026-01-02T01:00:00Z", "unrelated");
+    let both = index(
+        "00000000-0000-4000-8000-000000000003",
+        "Needle work",
+        "2026-01-03T01:00:00Z",
+        "the needle again",
+    );
+    let cancel = Cancellation::default();
+    let directory = tempfile::tempdir().unwrap();
+    let query = SearchQuery {
+        text: "needle".into(),
+        ..Default::default()
+    };
+    let snapshot = store
+        .with_read_snapshot(|source| {
+            SearchSnapshot::capture(source, &query, directory.path(), &cancel)
+        })
+        .unwrap();
+    let (hits, next) = snapshot.page(0).unwrap();
+    assert!(next.is_none());
+    let order: Vec<_> = hits
+        .iter()
+        .map(|hit| (hit.session.as_str(), hit.kind))
+        .collect();
+    assert_eq!(
+        order,
+        [
+            (both.as_str(), HitKind::Title),
+            (both.as_str(), HitKind::Message),
+            (titled.as_str(), HitKind::Title),
+            (old.as_str(), HitKind::Message),
+        ]
+    );
+    assert_eq!((snapshot.count, snapshot.sessions), (4, 3));
+    let totals = snapshot.totals(&hits).unwrap();
+    assert_eq!((totals[&both], totals[&titled], totals[&old]), (1, 0, 1));
 }
