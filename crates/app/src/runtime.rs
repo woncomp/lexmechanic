@@ -10,7 +10,7 @@ use agent_chat_reader_core::{
     },
     model::*,
     scan::{self, ScanEvent, SharedWriter},
-    search::{SearchCursor, SearchHit, SearchQuery},
+    search::{HitKind, SearchCursor, SearchHit, SearchQuery},
     snapshot::{DocumentSnapshot, SearchSnapshot},
     store::{MessageInfo, Store},
 };
@@ -1102,7 +1102,10 @@ fn spawn_reader(
                             generation,
                             hit,
                             permanent,
-                        } => (if hit.document_snapshot {
+                        } => (if hit.kind == HitKind::Title {
+                            live.session(&hit.session)
+                                .map(|session| session.is_some_and(|s| s.available && s.indexed))
+                        } else if hit.document_snapshot {
                             documents
                                 .get(&hit.session)
                                 .map(|document| {

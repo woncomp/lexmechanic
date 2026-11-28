@@ -49,6 +49,13 @@ impl SearchSnapshot {
         let mut cursor = SearchCursor::default();
         let mut count = 0;
         let mut metadata = std::collections::HashMap::new();
+        for hit in source.title_hits(query, cancel)? {
+            tx.execute(
+                "INSERT INTO hits(position,data) VALUES(?1,?2)",
+                params![i64::try_from(count)?, serde_json::to_string(&hit)?],
+            )?;
+            count += 1;
+        }
         loop {
             cancel.check()?;
             let page = source.search_page(query, cursor, cancel)?;

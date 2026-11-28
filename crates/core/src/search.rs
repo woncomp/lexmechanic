@@ -67,6 +67,13 @@ pub struct SearchQuery {
     pub members: Option<Vec<String>>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HitKind {
+    #[default]
+    Message,
+    Title,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SearchHit {
     pub session: String,
@@ -81,6 +88,8 @@ pub struct SearchHit {
     pub workspace: Option<String>,
     #[serde(default)]
     pub document_snapshot: bool,
+    #[serde(default)]
+    pub kind: HitKind,
 }
 
 #[derive(Clone, Debug, Default)]

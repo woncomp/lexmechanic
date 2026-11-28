@@ -1,7 +1,8 @@
 use agent_chat_reader_core::{
     agents::{AgentAdapter, copilot_cli::CopilotCli},
     model::*,
-    search::{SearchCursor, SearchQuery, find_ranges},
+    search::{HitKind, SearchCursor, SearchHit, SearchQuery, find_ranges},
+    snapshot::SearchSnapshot,
     store::Store,
 };
 use serde_json::{Value, json};
@@ -634,4 +635,95 @@ fn large_message_search_yields_a_byte_bounded_page_without_losing_remaining_hits
         .unwrap();
     assert_eq!(second.hits.len(), 1);
     assert_ne!(first.hits[1].message_id, second.hits[0].message_id);
+}
+
+#[test]
+fn title_search_matches_session_names_before_content_and_honors_filters() {
+    let fixture = Fixture::new();
+    let candidate = fixture.session(
+        A,
+        &[
+            start(),
+            msg(
+                "user.message",
+                "2026-01-01T01:00:00Z",
+                "synthetic body text",
+            ),
+        ],
+    );
+    let mut store = Store::open(&fixture.database).unwrap();
+    let session = fixture.index(&mut store, &candidate);
+    let key = candidate.key.storage_key();
+    let cancel = Cancellation::default();
+    let query = |text: &str| SearchQuery {
+        text: text.into(),
+        ..Default::default()
+    };
+
+    for text in ["SYNTHETIC SESSION", "ic se", "s"] {
+        let hits = store.title_hits(&query(text), &cancel).unwrap();
+        assert_eq!(hits.len(), 1, "{text}");
+        assert_eq!(hits[0].kind, HitKind::Title);
+        assert_eq!(hits[0].session, key);
+        assert_eq!(hits[0].session_name, session.name);
+    }
+    assert!(
+        store
+            .title_hits(&query("absent"), &cancel)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .title_hits(&query("body text"), &cancel)
+            .unwrap()
+            .is_empty()
+    );
+
+    let excluded = [
+        SearchQuery {
+            role: Some(Role::User),
+            ..query("synthetic")
+        },
+        SearchQuery {
+            session: Some(key.clone()),
+            ..query("synthetic")
+        },
+        SearchQuery {
+            workspace: Some("nowhere".into()),
+            ..query("synthetic")
+        },
+        SearchQuery {
+            members: Some(Vec::new()),
+            ..query("synthetic")
+        },
+        SearchQuery {
+            since: Some(chrono::Utc::now() + chrono::Duration::days(1)),
+            ..query("synthetic")
+        },
+    ];
+    for query in &excluded {
+        assert!(store.title_hits(query, &cancel).unwrap().is_empty());
+    }
+
+    // The snapshot lists title hits ahead of the content hits of the same query.
+    let directory = tempfile::tempdir().unwrap();
+    let snapshot = store
+        .with_read_snapshot(|source| {
+            SearchSnapshot::capture(source, &query("synthetic"), directory.path(), &cancel)
+        })
+        .unwrap();
+    let (hits, _) = snapshot.page(0).unwrap();
+    let kinds: Vec<_> = hits.iter().map(|hit| hit.kind).collect();
+    assert_eq!(kinds, [HitKind::Title, HitKind::Message]);
+}
+
+#[test]
+fn hits_without_a_kind_deserialize_as_message_hits() {
+    let hit: SearchHit = serde_json::from_value(json!({
+        "session": "s", "message_id": 1, "ordinal": 0, "role": "User",
+        "snippet": "x", "offset": 0
+    }))
+    .unwrap();
+    assert_eq!(hit.kind, HitKind::Message);
 }

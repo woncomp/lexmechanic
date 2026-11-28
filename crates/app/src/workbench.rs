@@ -8,7 +8,7 @@ use crate::{
 use agent_chat_reader_core::{
     model::{Cancellation, Role, Session, TimeMode},
     scan::{ScanEvent, ScanProgress},
-    search::{SearchCursor, SearchHit, SearchQuery},
+    search::{HitKind, SearchCursor, SearchHit, SearchQuery},
 };
 use gpui_kit::{
     component::{
@@ -152,7 +152,7 @@ pub struct Workbench {
 impl Workbench {
     pub fn new(directory: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let search_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Search all conversations  ·  Ctrl+Shift+F")
+            InputState::new(window, cx).placeholder("Search titles and messages  ·  Ctrl+Shift+F")
         });
         let filter_input = cx
             .new(|cx| InputState::new(window, cx).placeholder("Filter workspace or session name"));
@@ -1146,6 +1146,9 @@ impl Workbench {
     fn open_verified_hit(&mut self, hit: SearchHit, permanent: bool, cx: &mut Context<Self>) {
         if let Some(session) = self.sessions.get(&hit.session).cloned() {
             self.start_open(session, permanent, cx);
+            if hit.kind == HitKind::Title {
+                return;
+            }
             if let Some(document) = &mut self.document {
                 if !document.loading {
                     if !Self::jump_to_match(document, hit.message_id, hit.ordinal, hit.offset) {
@@ -1849,7 +1852,7 @@ impl Workbench {
                             })),
                     )
                     .child(format!(
-                        "{count} message hits{} · main conversations",
+                        "{count} hits{} · main conversations",
                         if self.hits_complete {
                             ""
                         } else if self.more_hits.is_some() {
@@ -1966,7 +1969,12 @@ impl Workbench {
                                 } else {
                                     hit.session_name.clone()
                                 };
-                                let detail = hit.snippet.clone();
+                                let is_title = hit.kind == HitKind::Title;
+                                let detail = if is_title {
+                                    String::new()
+                                } else {
+                                    hit.snippet.clone()
+                                };
                                 v_flex()
                                     .id(("search-hit", index))
                                     .p_3()
@@ -1987,13 +1995,17 @@ impl Workbench {
                                         div()
                                             .text_xs()
                                             .text_color(cx.theme().muted_foreground)
-                                            .child(format!(
-                                                "#{} · {}",
-                                                hit.ordinal + 1,
-                                                hit.role.label()
-                                            )),
+                                            .child(if is_title {
+                                                "Title match".to_owned()
+                                            } else {
+                                                format!(
+                                                    "#{} · {}",
+                                                    hit.ordinal + 1,
+                                                    hit.role.label()
+                                                )
+                                            }),
                                     )
-                                    .child(div().text_sm().child(detail))
+                                    .when(!is_title, |row| row.child(div().text_sm().child(detail)))
                                     .on_click(cx.listener(
                                         move |this, event: &ClickEvent, window, cx| {
                                             this.open_hit(

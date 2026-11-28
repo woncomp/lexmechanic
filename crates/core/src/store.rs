@@ -1,8 +1,8 @@
 use crate::{
     model::*,
     search::{
-        SearchCursor, SearchHit, SearchPage, SearchPosition, SearchQuery, find_ranges, first_range,
-        fts_phrase, normalize, snippet,
+        HitKind, SearchCursor, SearchHit, SearchPage, SearchPosition, SearchQuery, find_ranges,
+        first_range, fts_phrase, normalize, snippet,
     },
 };
 use anyhow::{Context, Result};
@@ -547,6 +547,51 @@ impl Store {
             .original_message(&session.candidate, &self.message(rowid)?)
     }
 
+    /// Session titles live in the session record rather than the FTS index, so they are matched
+    /// in memory. Titles have no role and are not part of a single-document find.
+    pub fn title_hits(&self, query: &SearchQuery, cancel: &Cancellation) -> Result<Vec<SearchHit>> {
+        if query.session.is_some() || query.role.is_some() {
+            return Ok(Vec::new());
+        }
+        let mut hits = Vec::new();
+        for session in self.sessions(query.mode)? {
+            cancel.check()?;
+            let key = session.candidate.key.storage_key();
+            if !session.available
+                || !session.indexed
+                || query
+                    .members
+                    .as_ref()
+                    .is_some_and(|members| !members.contains(&key))
+                || query
+                    .workspace
+                    .as_ref()
+                    .is_some_and(|workspace| session.workspace.as_ref() != Some(workspace))
+                || query
+                    .since
+                    .is_some_and(|since| session.time(query.mode).is_none_or(|time| time < since))
+            {
+                continue;
+            }
+            let Some(range) = first_range(&session.name, &query.text) else {
+                continue;
+            };
+            hits.push(SearchHit {
+                session: key,
+                message_id: 0,
+                ordinal: 0,
+                role: Role::User,
+                snippet: session.name.clone(),
+                offset: range.start,
+                session_name: session.name,
+                workspace: session.workspace,
+                document_snapshot: false,
+                kind: HitKind::Title,
+            });
+        }
+        Ok(hits)
+    }
+
     pub fn search_page(
         &self,
         query: &SearchQuery,
@@ -676,6 +721,7 @@ impl Store {
                         session_name: String::new(),
                         workspace: None,
                         document_snapshot: query.session.is_some(),
+                        kind: HitKind::Message,
                     });
                 }
                 if processed_bytes >= 2 * 1024 * 1024 {
