@@ -31,7 +31,6 @@ pub struct SearchSnapshot {
     connection: Connection,
     _file: TempPath,
     pub count: usize,
-    pub sessions: usize,
 }
 
 impl SearchSnapshot {
@@ -98,18 +97,12 @@ impl SearchSnapshot {
                 None => break,
             }
         }
-        tx.execute_batch(
-            "CREATE INDEX hits_order ON hits(rank,kind,seq);             CREATE INDEX hits_session ON hits(session,kind);",
-        )?;
-        let sessions = tx.query_row("SELECT COUNT(DISTINCT session) FROM hits", [], |row| {
-            row.get::<_, i64>(0)
-        })?;
+        tx.execute_batch("CREATE INDEX hits_order ON hits(rank,kind,seq);")?;
         tx.commit()?;
         Ok(Self {
             connection,
             _file: file,
             count,
-            sessions: usize::try_from(sessions)?,
         })
     }
 
@@ -123,21 +116,5 @@ impl SearchSnapshot {
             .collect::<Result<_>>()?;
         let next = offset + hits.len();
         Ok((hits, (next < self.count).then_some(next)))
-    }
-
-    /// Message-hit totals over the whole result for the sessions of `hits`, so a session split
-    /// across pages still reports its full count.
-    pub fn totals(&self, hits: &[SearchHit]) -> Result<HashMap<String, usize>> {
-        let mut statement = self
-            .connection
-            .prepare_cached("SELECT COUNT(*) FROM hits WHERE session=?1 AND kind=1")?;
-        let mut totals = HashMap::new();
-        for hit in hits {
-            if !totals.contains_key(&hit.session) {
-                let total = statement.query_row([&hit.session], |row| row.get::<_, i64>(0))?;
-                totals.insert(hit.session.clone(), usize::try_from(total)?);
-            }
-        }
-        Ok(totals)
     }
 }

@@ -1,6 +1,7 @@
 use super::{Workbench, message_rail::role_accent};
-use crate::session_table::SessionTable;
+use crate::{runtime::SEARCH_HIT_LIMIT, session_table::SessionTable};
 use agent_chat_reader_core::search::{HitKind, SearchHit, find_ranges};
+use chrono::{DateTime, Utc};
 use gpui_kit::{
     component::{
         button::{Button, ButtonVariants},
@@ -10,11 +11,7 @@ use gpui_kit::{
     prelude::FluentBuilder,
     *,
 };
-use std::{
-    cell::RefCell,
-    collections::{HashMap, HashSet},
-    rc::Rc,
-};
+use std::{cell::RefCell, collections::HashSet, ops::Range, rc::Rc};
 
 /// Rows have fixed heights so the scroll extent is known before any row is drawn.
 const HEADER_HEIGHT: Pixels = px(32.);
@@ -28,13 +25,10 @@ pub(super) enum SearchRow {
         key: String,
         /// Index of the title hit of the session, shown in the header rather than as a row.
         title: Option<usize>,
-        /// Index of the first hit of the session on this page.
+        /// Index of the first hit of the session.
         first: usize,
-        /// Message hits of the session on this page.
+        /// Message hits of the session.
         hits: usize,
-        /// Message hits of the session across all pages.
-        total: usize,
-        continued: bool,
         collapsed: bool,
     },
     Hit(usize),
@@ -113,90 +107,186 @@ impl ScrollbarHandle for SearchScroll {
     }
 }
 
-/// Groups a page of hits, which arrives in session order, into header and hit rows.
-pub(super) fn build_rows(
-    hits: &[SearchHit],
-    totals: &HashMap<String, usize>,
-    collapsed: &HashSet<String>,
-    continued_from: Option<&str>,
-) -> Vec<SearchRow> {
-    let mut rows = Vec::new();
-    let mut header = 0;
-    for (index, hit) in hits.iter().enumerate() {
-        if index == 0 || hits[index - 1].session != hit.session {
-            header = rows.len();
-            rows.push(SearchRow::Session {
-                key: hit.session.clone(),
-                title: None,
-                first: index,
-                hits: 0,
-                total: totals.get(&hit.session).copied().unwrap_or_default(),
-                continued: index == 0 && continued_from == Some(hit.session.as_str()),
-                collapsed: collapsed.contains(&hit.session),
-            });
-        }
-        let SearchRow::Session {
-            title,
-            hits,
-            collapsed,
-            ..
-        } = &mut rows[header]
-        else {
-            unreachable!("every group starts with a header");
-        };
-        if hit.kind == HitKind::Title {
-            *title = Some(index);
-        } else {
-            *hits += 1;
-            if !*collapsed {
-                rows.push(SearchRow::Hit(index));
+struct Group {
+    key: String,
+    /// The session time when the group first appeared; groups never move afterwards.
+    time: Option<DateTime<Utc>>,
+    title: Option<usize>,
+    hits: Vec<usize>,
+}
+
+/// Global search results grouped by session, newest session first.
+///
+/// Each session arrives once and complete, so a group never changes after it is added; later
+/// sessions are only inserted between the existing groups. The hits themselves stay in the order
+/// they arrived and are referred to by index.
+#[derive(Default)]
+pub(super) struct SearchResults {
+    groups: Vec<Group>,
+}
+
+impl SearchResults {
+    pub(super) fn clear(&mut self) {
+        self.groups.clear();
+    }
+
+    pub(super) fn sessions(&self) -> usize {
+        self.groups.len()
+    }
+
+    /// Adds `hits[start..]`, whose sessions arrive whole; `time` places each new session.
+    pub(super) fn add(
+        &mut self,
+        hits: &[SearchHit],
+        start: usize,
+        time: impl Fn(&str) -> Option<DateTime<Utc>>,
+    ) {
+        let mut slot = 0;
+        for (index, hit) in hits.iter().enumerate().skip(start) {
+            if index == start || hits[index - 1].session != hit.session {
+                let time = time(&hit.session);
+                slot = self.groups.partition_point(|group| {
+                    time.cmp(&group.time)
+                        .then_with(|| group.key.cmp(&hit.session))
+                        .is_lt()
+                });
+                self.groups.insert(
+                    slot,
+                    Group {
+                        key: hit.session.clone(),
+                        time,
+                        title: None,
+                        hits: Vec::new(),
+                    },
+                );
+            }
+            let group = &mut self.groups[slot];
+            match hit.kind {
+                HitKind::Title => group.title = Some(index),
+                HitKind::Message => group.hits.push(index),
             }
         }
     }
-    rows
+
+    pub(super) fn rows(&self, collapsed: &HashSet<String>) -> Vec<SearchRow> {
+        let mut rows = Vec::new();
+        for group in &self.groups {
+            let collapsed = collapsed.contains(&group.key);
+            rows.push(SearchRow::Session {
+                key: group.key.clone(),
+                title: group.title,
+                first: group
+                    .title
+                    .or(group.hits.first().copied())
+                    .unwrap_or_default(),
+                hits: group.hits.len(),
+                collapsed,
+            });
+            if !collapsed {
+                rows.extend(group.hits.iter().copied().map(SearchRow::Hit));
+            }
+        }
+        rows
+    }
+
+    /// Hit indexes in display order, for stepping through the results.
+    pub(super) fn order(&self) -> Vec<usize> {
+        self.groups
+            .iter()
+            .flat_map(|group| group.title.iter().chain(&group.hits).copied())
+            .collect()
+    }
+}
+
+/// The list splices, applied in order, that turn the `old` rows into the `new` ones. Rows that
+/// only appeared or only disappeared are spliced on their own, so rows around them, and the
+/// scroll position, are kept.
+pub(super) fn row_splices(old: &[SearchRow], new: &[SearchRow]) -> Vec<(Range<usize>, usize)> {
+    let subsequence = |short: &[SearchRow], long: &[SearchRow]| {
+        let mut rest = long.iter();
+        short.iter().all(|row| rest.any(|other| other == row))
+    };
+    // Runs of `long` rows missing from `short`, as (index in `long`, length).
+    let runs = |short: &[SearchRow], long: &[SearchRow]| {
+        let mut runs = Vec::new();
+        let mut kept = short.iter().peekable();
+        let mut index = 0;
+        while index < long.len() {
+            if kept.peek() == Some(&&long[index]) {
+                kept.next();
+                index += 1;
+                continue;
+            }
+            let start = index;
+            while index < long.len() && kept.peek() != Some(&&long[index]) {
+                index += 1;
+            }
+            runs.push((start, index - start));
+        }
+        runs
+    };
+    if subsequence(old, new) {
+        return runs(old, new)
+            .into_iter()
+            .map(|(start, length)| (start..start, length))
+            .collect();
+    }
+    if subsequence(new, old) {
+        let mut removed = 0;
+        return runs(new, old)
+            .into_iter()
+            .map(|(start, length)| {
+                let at = start - removed;
+                removed += length;
+                (at..at + length, 0)
+            })
+            .collect();
+    }
+    let prefix = old.iter().zip(new).take_while(|(a, b)| a == b).count();
+    let suffix = old[prefix..]
+        .iter()
+        .rev()
+        .zip(new[prefix..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    vec![(prefix..old.len() - suffix, new.len() - prefix - suffix)]
 }
 
 impl Workbench {
-    pub(super) fn rebuild_search_rows(&mut self) {
-        self.search_rows = build_rows(
-            &self.hits,
-            &self.hit_totals,
-            &self.collapsed_groups,
-            self.page_tail.as_deref(),
-        );
+    /// Rebuilds the rows from scratch, for a new search.
+    pub(super) fn reset_search_rows(&mut self) {
+        self.search_rows = self.results.rows(&self.collapsed_groups);
         self.search_scroll.set_rows(&self.search_rows);
         self.search_scroll.list.reset(self.search_rows.len());
     }
 
-    /// Regroups the same hits after a group is collapsed or expanded, replacing only the changed
-    /// rows so the list keeps its scroll position.
-    fn regroup_search_rows(&mut self) {
-        let rows = build_rows(
-            &self.hits,
-            &self.hit_totals,
-            &self.collapsed_groups,
-            self.page_tail.as_deref(),
-        );
+    /// Brings the rows up to date, changing only the rows that appeared or disappeared so the
+    /// list keeps its scroll position.
+    pub(super) fn update_search_rows(&mut self) {
+        let rows = self.results.rows(&self.collapsed_groups);
         let old = std::mem::replace(&mut self.search_rows, rows);
-        let new = &self.search_rows;
-        let prefix = old.iter().zip(new).take_while(|(a, b)| a == b).count();
-        let suffix = old[prefix..]
-            .iter()
-            .rev()
-            .zip(new[prefix..].iter().rev())
-            .take_while(|(a, b)| a == b)
-            .count();
-        self.search_scroll.set_rows(new);
-        self.search_scroll
-            .list
-            .splice(prefix..old.len() - suffix, new.len() - prefix - suffix);
+        self.search_scroll.set_rows(&self.search_rows);
+        // The list keeps its top row in view when rows are inserted above it. At the very start
+        // of the results, stay at the start instead, so newer sessions show up rather than
+        // pushing the view down.
+        let top = self.search_scroll.list.logical_scroll_top();
+        let at_start = top.item_ix == 0 && top.offset_in_item == px(0.);
+        for (range, count) in row_splices(&old, &self.search_rows) {
+            self.search_scroll.list.splice(range, count);
+        }
+        if at_start {
+            self.search_scroll.list.scroll_to(ListOffset {
+                item_ix: 0,
+                offset_in_item: px(0.),
+            });
+        }
     }
 
     fn toggle_group(&mut self, key: &str, cx: &mut Context<Self>) {
         if !self.collapsed_groups.remove(key) {
             self.collapsed_groups.insert(key.to_owned());
         }
-        self.regroup_search_rows();
+        self.update_search_rows();
         cx.notify();
     }
 
@@ -206,7 +296,7 @@ impl Workbench {
             return;
         };
         if self.collapsed_groups.remove(&hit.session) {
-            self.regroup_search_rows();
+            self.update_search_rows();
         }
         if let Some(row) = self.search_rows.iter().position(|row| match row {
             SearchRow::Session { title, .. } => *title == Some(index),
@@ -232,12 +322,8 @@ impl Workbench {
                 title,
                 first,
                 hits,
-                total,
-                continued,
                 collapsed,
-            }) => self.render_group_header(
-                index, key, *title, *first, *hits, *total, *continued, *collapsed, cx,
-            ),
+            }) => self.render_group_header(index, key, *title, *first, *hits, *collapsed, cx),
             Some(SearchRow::Hit(hit)) => self.render_hit_row(*hit, cx),
             None => div().into_any_element(),
         }
@@ -251,8 +337,6 @@ impl Workbench {
         title: Option<usize>,
         first: usize,
         hits: usize,
-        total: usize,
-        continued: bool,
         collapsed: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -270,7 +354,13 @@ impl Workbench {
             name.into_any_element()
         };
         let meta = [
-            (total > 0).then(|| total.to_string()),
+            (hits > 0).then(|| {
+                if hits >= SEARCH_HIT_LIMIT {
+                    format!("{hits}+")
+                } else {
+                    hits.to_string()
+                }
+            }),
             session
                 .as_ref()
                 .map(|session| SessionTable::date_label(session, self.settings.mode)),
@@ -325,16 +415,6 @@ impl Workbench {
                     .text_ellipsis()
                     .child(name),
             )
-            .when(continued, |header| {
-                header.child(
-                    div()
-                        .flex_shrink_0()
-                        .text_xs()
-                        .italic()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("continued"),
-                )
-            })
             .child(
                 div()
                     .flex_shrink_0()
@@ -402,13 +482,14 @@ impl Workbench {
 
 #[cfg(test)]
 mod tests {
-    use super::{HEADER_HEIGHT, HIT_HEIGHT, SearchRow, SearchScroll, build_rows};
+    use super::{HEADER_HEIGHT, HIT_HEIGHT, SearchResults, SearchRow, SearchScroll, row_splices};
     use agent_chat_reader_core::{
         model::Role,
         search::{HitKind, SearchHit},
     };
+    use chrono::{DateTime, TimeZone, Utc};
     use gpui_kit::{ListOffset, component::scroll::ScrollbarHandle, px};
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashSet;
 
     fn hit(session: &str, kind: HitKind) -> SearchHit {
         SearchHit {
@@ -431,61 +512,71 @@ mod tests {
             title,
             first,
             hits,
-            total: 0,
-            continued: false,
             collapsed: false,
         }
     }
 
-    #[test]
-    fn hits_group_under_their_session_with_the_title_hit_in_the_header() {
-        let hits = [
-            hit("a", HitKind::Title),
-            hit("a", HitKind::Message),
-            hit("a", HitKind::Message),
-            hit("b", HitKind::Title),
-            hit("c", HitKind::Message),
-        ];
-        let rows = build_rows(&hits, &HashMap::new(), &HashSet::new(), None);
-        assert_eq!(
-            rows,
-            [
-                header("a", Some(0), 0, 2),
-                SearchRow::Hit(1),
-                SearchRow::Hit(2),
-                header("b", Some(3), 3, 0),
-                header("c", None, 4, 1),
-                SearchRow::Hit(4),
-            ]
-        );
+    /// Session "a" is the newest and "c" the oldest.
+    fn time(key: &str) -> Option<DateTime<Utc>> {
+        let day = match key {
+            "a" => 3,
+            "b" => 2,
+            "c" => 1,
+            _ => return None,
+        };
+        Some(Utc.with_ymd_and_hms(2026, 1, day, 0, 0, 0).unwrap())
     }
 
     #[test]
-    fn collapsed_groups_drop_hit_rows_and_a_carried_over_group_is_marked() {
-        let hits = [
+    fn sessions_are_placed_by_time_as_they_arrive_and_keep_the_title_in_the_header() {
+        let mut hits = vec![hit("b", HitKind::Title), hit("b", HitKind::Message)];
+        let mut results = SearchResults::default();
+        results.add(&hits, 0, time);
+        // Later arrivals land before and after the existing group.
+        hits.extend([
+            hit("c", HitKind::Message),
             hit("a", HitKind::Message),
             hit("a", HitKind::Message),
-            hit("b", HitKind::Message),
-        ];
-        let totals = HashMap::from([("a".to_owned(), 7)]);
-        let collapsed = HashSet::from(["a".to_owned()]);
-        let rows = build_rows(&hits, &totals, &collapsed, Some("a"));
+        ]);
+        results.add(&hits, 2, time);
         assert_eq!(
-            rows,
+            results.rows(&HashSet::new()),
             [
-                SearchRow::Session {
-                    key: "a".into(),
-                    title: None,
-                    first: 0,
-                    hits: 2,
-                    total: 7,
-                    continued: true,
-                    collapsed: true,
-                },
-                header("b", None, 2, 1),
+                header("a", None, 3, 2),
+                SearchRow::Hit(3),
+                SearchRow::Hit(4),
+                header("b", Some(0), 0, 1),
+                SearchRow::Hit(1),
+                header("c", None, 2, 1),
                 SearchRow::Hit(2),
             ]
         );
+        assert_eq!(results.order(), [3, 4, 0, 1, 2]);
+        assert_eq!(results.sessions(), 3);
+        let collapsed = HashSet::from(["a".to_owned()]);
+        assert_eq!(results.rows(&collapsed)[1], header("b", Some(0), 0, 1));
+    }
+
+    #[test]
+    fn row_splices_insert_and_remove_only_the_changed_runs() {
+        let old = [header("b", None, 0, 1), SearchRow::Hit(0)];
+        let new = [
+            header("a", None, 2, 1),
+            SearchRow::Hit(2),
+            header("b", None, 0, 1),
+            SearchRow::Hit(0),
+            header("c", None, 1, 0),
+        ];
+        assert_eq!(row_splices(&old, &new), [(0..0, 2), (4..4, 1)]);
+        assert_eq!(row_splices(&new, &old), [(0..2, 0), (2..3, 0)]);
+        let collapsed = [SearchRow::Session {
+            key: "b".into(),
+            title: None,
+            first: 0,
+            hits: 1,
+            collapsed: true,
+        }];
+        assert_eq!(row_splices(&old, &collapsed), [(0..2, 1)]);
     }
 
     #[test]

@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     fs::File,
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -551,6 +552,104 @@ impl Store {
     /// in memory. Titles have no role and are not part of a single-document find.
     pub fn title_hits(&self, query: &SearchQuery, cancel: &Cancellation) -> Result<Vec<SearchHit>> {
         title_hits(self.sessions(query.mode)?, query, cancel)
+    }
+
+    /// Sessions whose messages are completely indexed, newest first. Only these are searched.
+    pub fn searchable_sessions(&self, mode: TimeMode) -> Result<Vec<String>> {
+        let order = match mode {
+            TimeMode::Latest => "latest",
+            TimeMode::FirstAssistant => "first_assistant",
+        };
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT id FROM sessions WHERE json_extract(data,'$.available')=1
+             AND json_extract(data,'$.indexed')=1 ORDER BY {order} IS NULL,{order} DESC,id"
+        ))?;
+        statement
+            .query_map([], |row| row.get(0))?
+            .map(|row| Ok(row?))
+            .collect()
+    }
+
+    /// Changes whenever another connection commits, so an unchanged value means nothing new.
+    pub fn data_version(&self) -> Result<i64> {
+        Ok(self
+            .connection
+            .query_row("PRAGMA data_version", [], |row| row.get(0))?)
+    }
+
+    /// Searches the given sessions and reports each session with hits once, complete: its title
+    /// hit first, then its message hits in message order, at most `per_session` of them.
+    /// `found` returns whether to go on with the next session.
+    pub fn search_sessions(
+        &self,
+        query: &SearchQuery,
+        sessions: &[String],
+        per_session: usize,
+        cancel: &Cancellation,
+        mut found: impl FnMut(Vec<SearchHit>) -> Result<bool>,
+    ) -> Result<()> {
+        let query = SearchQuery {
+            members: Some(sessions.to_vec()),
+            session: None,
+            ..query.clone()
+        };
+        let mut titles: HashMap<String, SearchHit> =
+            title_hits(self.sessions(query.mode)?, &query, cancel)?
+                .into_iter()
+                .map(|hit| (hit.session.clone(), hit))
+                .collect();
+        let mut current: Option<(String, Vec<SearchHit>)> = None;
+        let mut finish = |current: Option<(String, Vec<SearchHit>)>,
+                          titles: &mut HashMap<String, SearchHit>|
+         -> Result<bool> {
+            let Some((key, messages)) = current else {
+                return Ok(true);
+            };
+            let session = self
+                .session(&key)?
+                .context("Search session disappeared from the index")?;
+            let mut hits: Vec<SearchHit> = titles.remove(&key).into_iter().collect();
+            hits.extend(messages.into_iter().map(|mut hit| {
+                hit.session_name = session.name.clone();
+                hit.workspace = session.workspace.clone();
+                hit
+            }));
+            found(hits)
+        };
+        let mut cursor = SearchCursor::default();
+        loop {
+            cancel.check()?;
+            let page = self.search_page(&query, cursor, cancel)?;
+            for hit in page.hits {
+                if current.as_ref().is_none_or(|(key, _)| *key != hit.session) {
+                    if !finish(current.take(), &mut titles)? {
+                        return Ok(());
+                    }
+                    current = Some((hit.session.clone(), Vec::new()));
+                }
+                if let Some((_, hits)) = &mut current
+                    && hits.len() < per_session
+                {
+                    hits.push(hit);
+                }
+            }
+            match page.next {
+                Some(next) => cursor = next,
+                None => break,
+            }
+        }
+        if !finish(current.take(), &mut titles)? {
+            return Ok(());
+        }
+        // Sessions that only matched by title, in the order they were given.
+        for key in sessions {
+            if let Some(hit) = titles.remove(key)
+                && !found(vec![hit])?
+            {
+                return Ok(());
+            }
+        }
+        Ok(())
     }
 
     pub fn search_page(

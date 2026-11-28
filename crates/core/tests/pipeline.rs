@@ -778,7 +778,84 @@ fn search_snapshot_groups_title_and_message_hits_in_session_order() {
             (old.as_str(), HitKind::Message),
         ]
     );
-    assert_eq!((snapshot.count, snapshot.sessions), (4, 3));
-    let totals = snapshot.totals(&hits).unwrap();
-    assert_eq!((totals[&both], totals[&titled], totals[&old]), (1, 0, 1));
+    assert_eq!(snapshot.count, 4);
+}
+
+#[test]
+fn live_search_covers_whole_indexed_sessions_only() {
+    let fixture = Fixture::new();
+    let mut store = Store::open(&fixture.database).unwrap();
+    let mut index = |native: &str, name: &str, time: &str, bodies: &[&str], indexed: bool| {
+        let mut events = vec![start()];
+        events.extend(bodies.iter().map(|body| msg("user.message", time, body)));
+        let candidate = fixture.session(native, &events);
+        let mut session = fixture.index(&mut store, &candidate);
+        session.name = name.into();
+        session.indexed = indexed;
+        store.upsert_session(&session).unwrap();
+        candidate.key.storage_key()
+    };
+    let old = index(
+        A,
+        "Older work",
+        "2026-01-01T01:00:00Z",
+        &["a needle", "another needle"],
+        true,
+    );
+    let titled = index(
+        B,
+        "Needle plan",
+        "2026-01-02T01:00:00Z",
+        &["unrelated"],
+        true,
+    );
+    index(
+        "00000000-0000-4000-8000-000000000003",
+        "Still indexing",
+        "2026-01-03T01:00:00Z",
+        &["needle in progress"],
+        false,
+    );
+    assert_eq!(
+        store.searchable_sessions(TimeMode::Latest).unwrap(),
+        [titled.clone(), old.clone()]
+    );
+
+    let query = SearchQuery {
+        text: "needle".into(),
+        ..Default::default()
+    };
+    let cancel = Cancellation::default();
+    let mut groups = Vec::new();
+    store
+        .search_sessions(&query, &[titled.clone(), old.clone()], 1, &cancel, |hits| {
+            groups.push(hits);
+            Ok(true)
+        })
+        .unwrap();
+    let shape: Vec<Vec<_>> = groups
+        .iter()
+        .map(|hits| {
+            hits.iter()
+                .map(|hit| (hit.session.as_str(), hit.kind))
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            vec![(old.as_str(), HitKind::Message)],
+            vec![(titled.as_str(), HitKind::Title)],
+        ]
+    );
+    assert_eq!(groups[0][0].session_name, "Older work");
+
+    let mut reported = 0;
+    store
+        .search_sessions(&query, &[titled, old], 10, &cancel, |_| {
+            reported += 1;
+            Ok(false)
+        })
+        .unwrap();
+    assert_eq!(reported, 1);
 }

@@ -1,6 +1,7 @@
 use crate::{
     document::{CachedChunk, Document},
     persistence::{ReadingPosition, Settings},
+    runtime::SEARCH_HIT_LIMIT,
     runtime::{Event, Runtime},
     session_table::{DATE_COLUMN, SessionTable, migrate_widths},
     tabs::Tabs,
@@ -38,7 +39,7 @@ pub(crate) mod message_rail;
 #[path = "search_results.rs"]
 pub(crate) mod search_results;
 
-use search_results::{SearchRow, SearchScroll};
+use search_results::{SearchResults, SearchRow, SearchScroll};
 
 actions!(
     reader,
@@ -128,17 +129,16 @@ pub struct Workbench {
     query_local: bool,
     query_text: String,
     hits: Vec<SearchHit>,
-    hits_scanned: usize,
     hits_complete: bool,
+    /// Further pages of a local find.
     more_hits: Option<SearchCursor>,
     hit_index: usize,
-    hit_sessions: usize,
-    hit_totals: HashMap<String, usize>,
+    /// Global search results, grouped by session over `hits`.
+    results: SearchResults,
+    search_capped: bool,
     search_rows: Vec<SearchRow>,
     search_scroll: SearchScroll,
     collapsed_groups: HashSet<String>,
-    /// The session of the last hit on the previous page, whose group may carry over.
-    page_tail: Option<String>,
     search_mode: bool,
     find_visible: bool,
     show_settings: bool,
@@ -247,10 +247,14 @@ impl Workbench {
             }
         }));
         subscriptions.push(
-            cx.subscribe_in(&search_input, window, |this, _, event, _, cx| {
+            cx.subscribe_in(&search_input, window, |this, input, event, _, cx| {
                 if matches!(event, InputEvent::Change | InputEvent::PressEnter { .. }) {
                     this.query_local = false;
                     this.queue_search(cx);
+                    // Clearing the box, by hand or with its clear button, ends the search at once.
+                    if input.read(cx).value().is_empty() {
+                        this.search_mode = false;
+                    }
                 }
             }),
         );
@@ -382,16 +386,14 @@ impl Workbench {
             query_local: false,
             query_text: String::new(),
             hits: Vec::new(),
-            hits_scanned: 0,
             hits_complete: true,
             more_hits: None,
             hit_index: 0,
-            hit_sessions: 0,
-            hit_totals: HashMap::new(),
+            results: SearchResults::default(),
+            search_capped: false,
             search_rows: Vec::new(),
             search_scroll: SearchScroll::new(),
             collapsed_groups: HashSet::new(),
-            page_tail: None,
             search_mode: false,
             find_visible: false,
             show_settings: false,
@@ -583,19 +585,28 @@ impl Workbench {
                         )
                     };
                 }
-                Event::SearchState {
-                    generation,
-                    message,
-                } if generation == self.query_generation => {
-                    self.search_state = message;
-                }
                 Event::SearchFailed {
                     generation,
                     message,
                 } if generation == self.query_generation => {
                     self.hits_complete = true;
-                    self.search_state = format!("搜索失败：{message}");
+                    self.search_state = format!("Search failed: {message}");
                     self.error(message);
+                }
+                Event::SearchHits { generation, hits } if generation == self.query_generation => {
+                    let start = self.hits.len();
+                    self.hits.extend(hits);
+                    let (sessions, mode) = (&self.sessions, self.settings.mode);
+                    self.results.add(&self.hits, start, |key| {
+                        sessions.get(key).and_then(|session| session.time(mode))
+                    });
+                    self.update_search_rows();
+                    self.search_state.clear();
+                }
+                Event::SearchDone { generation, capped } if generation == self.query_generation => {
+                    self.hits_complete = true;
+                    self.search_capped = capped;
+                    self.search_state.clear();
                 }
                 Event::OpenHit {
                     generation,
@@ -757,17 +768,11 @@ impl Workbench {
                 Event::Hits {
                     generation,
                     hits,
-                    scanned,
-                    sessions,
-                    totals,
                     complete,
                     more,
+                    ..
                 } if generation == self.query_generation => {
                     self.hits.extend(hits);
-                    self.hits_scanned = scanned;
-                    self.hit_sessions = sessions;
-                    self.hit_totals.extend(totals);
-                    self.rebuild_search_rows();
                     self.hits_complete = complete;
                     self.more_hits = more;
                     self.search_state.clear();
@@ -971,7 +976,8 @@ impl Workbench {
         self.finished.clear();
         self.catalog_done = false;
         self.hits.clear();
-        self.rebuild_search_rows();
+        self.results.clear();
+        self.reset_search_rows();
         self.restore_pending = self.tabs.active.clone();
         self.table.update(cx, |table, cx| {
             table.delegate_mut().rows.clear();
@@ -990,11 +996,13 @@ impl Workbench {
         self.query_generation += 1;
         self.query_due = Some(Instant::now() + Duration::from_millis(180));
         self.hits.clear();
+        self.results.clear();
         self.hits_complete = false;
+        self.search_capped = false;
         self.more_hits = None;
         self.hit_index = usize::MAX;
-        self.rebuild_search_rows();
-        self.search_state = "准备搜索…".into();
+        self.reset_search_rows();
+        self.search_state = "Starting search…".into();
         cx.notify();
     }
 
@@ -1007,14 +1015,13 @@ impl Workbench {
         };
         self.search_mode = !self.query_local && !self.query_text.is_empty();
         self.hits.clear();
-        self.hits_scanned = 0;
-        self.hit_sessions = 0;
-        self.hit_totals.clear();
+        self.results.clear();
+        self.search_capped = false;
         self.collapsed_groups.clear();
-        self.page_tail = None;
-        self.rebuild_search_rows();
+        self.reset_search_rows();
         self.hits_complete = self.query_text.is_empty();
         if self.query_text.is_empty() {
+            self.search_state.clear();
             return;
         }
         self.send_search(SearchCursor::default());
@@ -1111,27 +1118,31 @@ impl Workbench {
 
     fn next_search_page(&mut self, cx: &mut Context<Self>) {
         if let Some(cursor) = self.more_hits.take() {
-            self.page_tail = self.hits.last().map(|hit| hit.session.clone());
             self.hits.clear();
-            self.hit_totals.clear();
             self.hit_index = usize::MAX;
-            self.rebuild_search_rows();
             self.send_search(cursor);
             cx.notify();
         }
     }
 
     fn step_hit(&mut self, backwards: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.hits.is_empty() {
+        // Global results are stepped in display order; a local find is already in order.
+        let order: Vec<usize> = if self.search_mode {
+            self.results.order()
+        } else {
+            (0..self.hits.len()).collect()
+        };
+        if order.is_empty() {
             return;
         }
-        self.hit_index = if self.hit_index >= self.hits.len() {
-            if backwards { self.hits.len() - 1 } else { 0 }
-        } else if backwards {
-            (self.hit_index + self.hits.len() - 1) % self.hits.len()
-        } else {
-            (self.hit_index + 1) % self.hits.len()
+        let position = order.iter().position(|&index| index == self.hit_index);
+        let next = match position {
+            None if backwards => order.len() - 1,
+            None => 0,
+            Some(position) if backwards => (position + order.len() - 1) % order.len(),
+            Some(position) => (position + 1) % order.len(),
         };
+        self.hit_index = order[next];
         if self.search_mode {
             self.reveal_search_hit(self.hit_index);
         }
@@ -1196,7 +1207,7 @@ impl Workbench {
             if let Some(document) = &mut self.document {
                 if !document.loading {
                     if !Self::jump_to_match(document, hit.message_id, hit.ordinal, hit.offset) {
-                        self.status = "命中属于不同的文档版本，请 Reload 或重新搜索。".into();
+                        self.status = "This match is from a different version of the conversation; reload it or search again.".into();
                     }
                 } else {
                     self.jump_pending = Some((hit.message_id, hit.ordinal, hit.offset));
@@ -1894,45 +1905,7 @@ impl Workbench {
             .size_full()
             .min_h_0()
             .gap_2()
-            .child(
-                h_flex()
-                    .p_2()
-                    .gap_2()
-                    .child(
-                        Button::new("back")
-                            .ghost()
-                            .small()
-                            .label("Back to sessions")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.search_mode = false;
-                                this.query_cancel.cancel();
-                                cx.notify();
-                            })),
-                    )
-                    .child(if !self.hits_complete && self.more_hits.is_none() {
-                        "Searching…".to_owned()
-                    } else {
-                        format!(
-                            "{} matches in {} sessions{}",
-                            self.hits_scanned,
-                            self.hit_sessions,
-                            if self.more_hits.is_some() {
-                                " · more on the next page"
-                            } else {
-                                ""
-                            }
-                        )
-                    })
-                    .when(self.more_hits.is_some(), |row| {
-                        row.child(
-                            Button::new("search-more")
-                                .ghost()
-                                .small()
-                                .label("Next page")
-                                .on_click(cx.listener(|this, _, _, cx| this.next_search_page(cx))),
-                        )
-                    }),
-            )
+            .pt_2()
             .child(
                 h_flex()
                     .px_2()
@@ -2572,7 +2545,23 @@ impl Render for Workbench {
         let search_status = if !self.search_state.is_empty() {
             Some(self.search_state.clone())
         } else if self.search_mode {
-            Some("搜索结果已固定；按 Enter 重新检查已有会话并搜索。".to_owned())
+            Some(format!(
+                "{}{} matches in {} sessions{}",
+                if self.hits_complete {
+                    ""
+                } else {
+                    "Searching… "
+                },
+                self.hits.len(),
+                self.results.sessions(),
+                if self.search_capped {
+                    format!(
+                        " · showing the first {SEARCH_HIT_LIMIT}; refine the search to see others"
+                    )
+                } else {
+                    String::new()
+                }
+            ))
         } else {
             None
         };
@@ -2731,7 +2720,11 @@ impl Render for Workbench {
                             .font_weight(FontWeight::SEMIBOLD)
                             .child("Lexmechanic"),
                     )
-                    .child(div().flex_1().child(Input::new(&self.search_input)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(Input::new(&self.search_input).cleanable(true)),
+                    )
                     .child(
                         Button::new("refresh")
                             .icon(IconName::RefreshCw)

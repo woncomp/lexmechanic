@@ -16,13 +16,14 @@ use agent_chat_reader_core::{
 };
 use anyhow::{Context, Result};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     io::Write,
     ops::Range,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, SyncSender},
     },
     thread::{self, JoinHandle},
@@ -55,13 +56,19 @@ pub enum Event {
     CatalogFinished {
         run_id: u64,
     },
-    SearchState {
-        generation: u64,
-        message: String,
-    },
     SearchFailed {
         generation: u64,
         message: String,
+    },
+    /// Complete sessions found by a global search, added to the results already shown.
+    SearchHits {
+        generation: u64,
+        hits: Vec<SearchHit>,
+    },
+    SearchDone {
+        generation: u64,
+        /// The search stopped at the hit limit rather than at the end of the index.
+        capped: bool,
     },
     Document {
         generation: u64,
@@ -86,11 +93,6 @@ pub enum Event {
     Hits {
         generation: u64,
         hits: Vec<SearchHit>,
-        scanned: usize,
-        /// Sessions with at least one hit across all pages.
-        sessions: usize,
-        /// Message-hit totals across all pages for each session on this page.
-        totals: HashMap<String, usize>,
         complete: bool,
         more: Option<SearchCursor>,
     },
@@ -146,10 +148,7 @@ struct SearchRequest {
 }
 
 enum SearchCommand {
-    Global {
-        request: SearchRequest,
-        members: Vec<Session>,
-    },
+    Global(SearchRequest),
     Document {
         request: SearchRequest,
         file: Arc<TempPath>,
@@ -164,7 +163,6 @@ enum ControlCommand {
     Refresh(Vec<PathBuf>, Option<Vec<PathBuf>>, Option<Vec<PathBuf>>),
     Save(Settings),
     Clear,
-    Search(SearchRequest),
 }
 
 pub struct Runtime {
@@ -217,6 +215,9 @@ impl Runtime {
         let worker_settings_lock = settings_lock.clone();
         let settings_path = directory.join("settings.json");
         let search_sender = searcher.clone();
+        // Set while a catalog run is scanning and indexing; a global search finishes after it.
+        let indexing = Arc::new(AtomicBool::new(true));
+        let search_indexing = indexing.clone();
         let catalog = thread::Builder::new()
             .name("catalog".into())
             .spawn(move || {
@@ -241,11 +242,6 @@ impl Runtime {
                         .lock()
                         .map_err(|_| anyhow::anyhow!("Index writer failed"))?
                         .sessions(settings.mode)?;
-                    let mut members: HashMap<_, _> = sessions
-                        .iter()
-                        .cloned()
-                        .map(|session| (session.candidate.key.storage_key(), session))
-                        .collect();
                     let reader = spawn_reader(
                         path.clone(),
                         writer.clone(),
@@ -257,10 +253,10 @@ impl Runtime {
                     )?;
                     let search = spawn_search(
                         path,
-                        writer.clone(),
                         searches,
                         sender.clone(),
                         snapshots,
+                        search_indexing,
                         worker_stop.clone(),
                     )?;
                     child_workers
@@ -296,12 +292,12 @@ impl Runtime {
                         &sender,
                         &worker_stop,
                     )?);
-                    let mut pending: Option<SearchRequest> = None;
                     while !worker_stop.is_cancelled() {
                         while let Ok(command) = commands.try_recv() {
                             match command {
                                 ControlCommand::Refresh(sources, vscode, codex) => {
                                     scan.take();
+                                    indexing.store(true, Ordering::SeqCst);
                                     roots = sources;
                                     vscode_roots = vscode;
                                     codex_roots = codex;
@@ -337,7 +333,7 @@ impl Runtime {
                                         .lock()
                                         .map_err(|_| anyhow::anyhow!("Index writer failed"))?
                                         .clear()?;
-                                    members.clear();
+                                    indexing.store(true, Ordering::SeqCst);
                                     run_id += 1;
                                     emit(&sender, Event::CatalogStarted { run_id }, &worker_stop)?;
                                     scan = Some(begin_scan(
@@ -349,22 +345,6 @@ impl Runtime {
                                         &worker_stop,
                                     )?);
                                 }
-                                ControlCommand::Search(request) => {
-                                    if let Some(old) = pending.take() {
-                                        old.cancel.cancel();
-                                    }
-                                    if scan.is_some() {
-                                        emit(
-                                            &sender,
-                                            Event::SearchState {
-                                                generation: request.generation,
-                                                message: "等待本轮索引完成…".into(),
-                                            },
-                                            &worker_stop,
-                                        )?;
-                                    }
-                                    pending = Some(request);
-                                }
                             }
                         }
                         let mut done = false;
@@ -373,18 +353,6 @@ impl Runtime {
                             for _ in 0..64 {
                                 match handle.events.try_recv() {
                                     Ok(event) => {
-                                        match &event {
-                                            ScanEvent::Session(session) => {
-                                                members.insert(
-                                                    session.candidate.key.storage_key(),
-                                                    (**session).clone(),
-                                                );
-                                            }
-                                            ScanEvent::Reclassified(replacement) => {
-                                                members.remove(&replacement.previous.storage_key());
-                                            }
-                                            _ => {}
-                                        }
                                         emit(
                                             &catalog_sender,
                                             Event::Scan { run_id, event },
@@ -401,23 +369,13 @@ impl Runtime {
                         }
                         if done {
                             scan.take();
+                            indexing.store(false, Ordering::SeqCst);
                             // This shares the FIFO with the last progress events.
                             emit(
                                 &catalog_sender,
                                 Event::CatalogFinished { run_id },
                                 &worker_stop,
                             )?;
-                        }
-                        if scan.is_none()
-                            && let Some(request) = pending.take()
-                            && !request.cancel.is_cancelled()
-                        {
-                            search_sender
-                                .send(SearchCommand::Global {
-                                    request,
-                                    members: members.values().cloned().collect(),
-                                })
-                                .context("Search worker closed")?;
                         }
                         thread::sleep(Duration::from_millis(20));
                     }
@@ -590,8 +548,8 @@ impl Runtime {
                     })
                     .context("Document queue is busy")
             } else {
-                self.control
-                    .try_send(ControlCommand::Search(SearchRequest {
+                self.searcher
+                    .try_send(SearchCommand::Global(SearchRequest {
                         generation,
                         query,
                         cancel,
@@ -726,10 +684,10 @@ fn begin_scan(
 
 fn spawn_search(
     database: PathBuf,
-    writer: SharedWriter,
     commands: Receiver<SearchCommand>,
     sender: SyncSender<Event>,
     directory: Arc<TempDir>,
+    indexing: Arc<AtomicBool>,
     stop: Cancellation,
 ) -> Result<JoinHandle<()>> {
     Ok(thread::Builder::new()
@@ -738,6 +696,7 @@ fn spawn_search(
             let work = || -> Result<()> {
                 let store = Store::open(&database)?;
                 let mut active: Option<(u64, SearchSnapshot, Cancellation)> = None;
+                let mut live: Option<LiveSearch> = None;
                 while !stop.is_cancelled() {
                     if active
                         .as_ref()
@@ -745,79 +704,37 @@ fn spawn_search(
                     {
                         active = None;
                     }
-                    let command = match commands.recv_timeout(Duration::from_millis(50)) {
+                    if live
+                        .as_ref()
+                        .is_some_and(|search| search.request.cancel.is_cancelled())
+                    {
+                        live = None;
+                    }
+                    // Commands are checked between steps, so a newer query interrupts promptly.
+                    let wait = match &live {
+                        Some(search) if search.has_work() => Duration::ZERO,
+                        Some(_) => Duration::from_millis(300),
+                        None => Duration::from_millis(50),
+                    };
+                    let command = match commands.recv_timeout(wait) {
                         Ok(command) => command,
-                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            if let Some(search) = &mut live
+                                && search.advance(&store, &indexing, &sender, &stop)?
+                            {
+                                live = None;
+                            }
+                            continue;
+                        }
                         Err(_) => break,
                     };
                     let (generation, result, cancel) = match command {
-                        SearchCommand::Global {
-                            mut request,
-                            members,
-                        } => {
-                            let generation = request.generation;
-                            if request.cancel.is_cancelled() {
-                                continue;
+                        SearchCommand::Global(request) => {
+                            if !request.cancel.is_cancelled() {
+                                active = None;
+                                live = Some(LiveSearch::new(request));
                             }
-                            active = None;
-                            request.query.members = Some(
-                                members
-                                    .iter()
-                                    .map(|member| member.candidate.key.storage_key())
-                                    .collect(),
-                            );
-                            let result = (|| -> Result<SearchSnapshot> {
-                                let mut writer = writer
-                                    .lock()
-                                    .map_err(|_| anyhow::anyhow!("Index writer failed"))?;
-                                for (index, member) in members.iter().enumerate() {
-                                    stop.check()?;
-                                    request.cancel.check()?;
-                                    emit(
-                                        &sender,
-                                        Event::SearchState {
-                                            generation,
-                                            message: format!(
-                                                "核对已有会话 {}/{}…",
-                                                index + 1,
-                                                members.len()
-                                            ),
-                                        },
-                                        &stop,
-                                    )?;
-                                    let (_, diagnostics) =
-                                        scan::prepare_known(&mut writer, member, &request.cancel)?;
-                                    for diagnostic in diagnostics {
-                                        emit(
-                                            &sender,
-                                            Event::Notice(diagnostic.description),
-                                            &stop,
-                                        )?;
-                                    }
-                                }
-                                request.cancel.check()?;
-                                emit(
-                                    &sender,
-                                    Event::SearchState {
-                                        generation,
-                                        message: "搜索中…".into(),
-                                    },
-                                    &stop,
-                                )?;
-                                store.with_read_snapshot(|source| {
-                                    drop(writer);
-                                    SearchSnapshot::capture(
-                                        source,
-                                        &request.query,
-                                        directory.path(),
-                                        &request.cancel,
-                                    )
-                                })
-                            })();
-                            if request.cancel.is_cancelled() {
-                                continue;
-                            }
-                            (generation, result, request.cancel)
+                            continue;
                         }
                         SearchCommand::Document { request, file } => {
                             if request.cancel.is_cancelled() {
@@ -880,6 +797,119 @@ fn spawn_search(
         })?)
 }
 
+/// Most hits a global search reports. It stops between sessions, so a session crossing the
+/// limit is still reported whole; a single session reports at most this many on its own.
+pub(crate) const SEARCH_HIT_LIMIT: usize = 5_000;
+/// Sessions searched in one step, between checks for newer commands.
+const SEARCH_CHUNK: usize = 64;
+
+/// A global search that follows the index. Each session is searched once, as soon as it is
+/// completely indexed; the search ends when the catalog run is over and every indexed session
+/// has been searched.
+struct LiveSearch {
+    request: SearchRequest,
+    searched: HashSet<String>,
+    pending: VecDeque<String>,
+    /// The index version when the pending sessions were listed.
+    version: Option<i64>,
+    hits: usize,
+}
+
+impl LiveSearch {
+    fn new(request: SearchRequest) -> Self {
+        Self {
+            request,
+            searched: HashSet::new(),
+            pending: VecDeque::new(),
+            version: None,
+            hits: 0,
+        }
+    }
+
+    fn has_work(&self) -> bool {
+        self.version.is_none() || !self.pending.is_empty()
+    }
+
+    /// Runs one step and returns whether the search has ended.
+    fn advance(
+        &mut self,
+        store: &Store,
+        indexing: &AtomicBool,
+        sender: &SyncSender<Event>,
+        stop: &Cancellation,
+    ) -> Result<bool> {
+        let generation = self.request.generation;
+        let event = match self.step(store, indexing, sender, stop) {
+            Ok(None) => return Ok(false),
+            Ok(Some(capped)) => Event::SearchDone { generation, capped },
+            Err(_) if self.request.cancel.is_cancelled() => return Ok(true),
+            Err(error) => {
+                stop.check()?;
+                Event::SearchFailed {
+                    generation,
+                    message: format!("{error:#}"),
+                }
+            }
+        };
+        emit(sender, event, stop)?;
+        Ok(true)
+    }
+
+    /// Searches the next sessions. Returns `Some(capped)` once the search is complete.
+    fn step(
+        &mut self,
+        store: &Store,
+        indexing: &AtomicBool,
+        sender: &SyncSender<Event>,
+        stop: &Cancellation,
+    ) -> Result<Option<bool>> {
+        if self.pending.is_empty() {
+            // Read before listing: a run that ends after the listing is caught on the next step.
+            let running = indexing.load(Ordering::SeqCst);
+            let version = store.data_version()?;
+            if self.version != Some(version) {
+                self.version = Some(version);
+                self.pending = store
+                    .searchable_sessions(self.request.query.mode)?
+                    .into_iter()
+                    .filter(|key| !self.searched.contains(key))
+                    .collect();
+            }
+            if self.pending.is_empty() {
+                return Ok((!running).then_some(false));
+            }
+        }
+        let count = self.pending.len().min(SEARCH_CHUNK);
+        let chunk: Vec<String> = self.pending.drain(..count).collect();
+        let mut found = Vec::new();
+        let mut total = self.hits;
+        store.search_sessions(
+            &self.request.query,
+            &chunk,
+            SEARCH_HIT_LIMIT,
+            &self.request.cancel,
+            |hits| {
+                total += hits.len();
+                found.extend(hits);
+                Ok(total < SEARCH_HIT_LIMIT)
+            },
+        )?;
+        self.hits = total;
+        self.searched.extend(chunk);
+        if !found.is_empty() {
+            emit(
+                sender,
+                Event::SearchHits {
+                    generation: self.request.generation,
+                    hits: found,
+                },
+                stop,
+            )?;
+        }
+        Ok((self.hits >= SEARCH_HIT_LIMIT).then_some(true))
+    }
+}
+
 fn send_page(
     sender: &SyncSender<Event>,
     generation: u64,
@@ -888,15 +918,11 @@ fn send_page(
     stop: &Cancellation,
 ) -> Result<()> {
     let (hits, next) = snapshot.page(offset)?;
-    let totals = snapshot.totals(&hits)?;
     emit(
         sender,
         Event::Hits {
             generation,
             hits,
-            scanned: snapshot.count,
-            sessions: snapshot.sessions,
-            totals,
             complete: next.is_none(),
             more: next.map(|offset| SearchCursor {
                 offset,
@@ -1139,7 +1165,7 @@ fn spawn_reader(
                                 emit(
                                     &sender,
                                     Event::Notice(
-                                        "该搜索结果已失效或内容无法读取，请重新搜索。".into(),
+                                        "This search result is outdated or its content cannot be read; search again.".into(),
                                     ),
                                     &stop,
                                 )
@@ -1420,21 +1446,50 @@ mod tests {
         )
     }
 
-    fn hits(reader: &Runtime, generation: u64) -> (Vec<SearchHit>, Option<SearchCursor>, usize) {
+    /// A page of a local find.
+    fn hits(reader: &Runtime, generation: u64) -> Vec<SearchHit> {
         let event = next(reader, |event| {
             matches!(event,
             Event::Hits { generation: actual, .. } if *actual == generation)
         });
-        let Event::Hits {
-            hits,
-            more,
-            scanned,
-            ..
-        } = event
-        else {
+        let Event::Hits { hits, .. } = event else {
             unreachable!()
         };
-        (hits, more, scanned)
+        hits
+    }
+
+    /// Every hit of a global search, collected until it is done, and whether it was capped.
+    fn live(reader: &Runtime, generation: u64) -> (Vec<SearchHit>, bool) {
+        let mut found = Vec::new();
+        let event = next(reader, |event| {
+            if let Event::SearchHits {
+                generation: actual,
+                hits,
+            } = event
+                && *actual == generation
+            {
+                found.extend(hits.iter().cloned());
+            }
+            matches!(event, Event::SearchDone { generation: actual, .. } if *actual == generation)
+        });
+        let Event::SearchDone { capped, .. } = event else {
+            unreachable!()
+        };
+        (found, capped)
+    }
+
+    fn global(reader: &Runtime, generation: u64, text: &str) {
+        reader
+            .search(
+                generation,
+                SearchQuery {
+                    text: text.into(),
+                    ..Default::default()
+                },
+                SearchCursor::default(),
+                Cancellation::default(),
+            )
+            .unwrap();
     }
 
     fn opened(reader: &Runtime, generation: u64) -> Vec<DocumentMessage> {
@@ -1450,7 +1505,7 @@ mod tests {
     }
 
     #[test]
-    fn no_automatic_scans_and_new_search_only_prepares_known_members() {
+    fn no_automatic_scans_and_search_reads_the_index_as_last_scanned() {
         let fixture = Fixture::new(1, true);
         let reader = Runtime::new(fixture.data.clone());
         let (sessions, progress) = catalog(&reader);
@@ -1484,18 +1539,8 @@ mod tests {
             matches!(event, Event::DocumentFailed { generation: 1, .. })
         });
         assert!(matches!(event, Event::DocumentFailed { message, .. } if !message.is_empty()));
-        reader
-            .search(
-                1,
-                SearchQuery {
-                    text: "later".into(),
-                    ..Default::default()
-                },
-                SearchCursor::default(),
-                Cancellation::default(),
-            )
-            .unwrap();
-        assert!(hits(&reader, 1).0.is_empty());
+        global(&reader, 1, "later");
+        assert!(live(&reader, 1).0.is_empty());
         fixture.append("later needle");
         fixture.write_session(B, 1, "later hidden new session");
         fs::create_dir(fixture.home.join("unrelated")).unwrap();
@@ -1507,31 +1552,31 @@ mod tests {
         {
             assert!(!matches!(
                 event,
-                Event::Scan { .. } | Event::CatalogStarted { .. } | Event::Hits { .. }
+                Event::Scan { .. } | Event::CatalogStarted { .. } | Event::SearchHits { .. }
             ));
         }
+        // A search reads the index as the last scan left it; changed files wait for a refresh.
+        global(&reader, 2, "later");
+        assert!(live(&reader, 2).0.is_empty());
         reader
-            .search(
-                2,
-                SearchQuery {
-                    text: "later".into(),
-                    ..Default::default()
-                },
-                SearchCursor::default(),
-                Cancellation::default(),
+            .refresh(
+                fixture.settings.sources.clone(),
+                Some(Vec::new()),
+                Some(Vec::new()),
             )
             .unwrap();
-        let (results, _, _) = hits(&reader, 2);
-        assert_eq!(results.len(), 1);
-        assert!(results[0].session.ends_with(A));
-        let store = Store::open(&fixture.data.join("index.sqlite")).unwrap();
-        assert_eq!(store.sessions(TimeMode::Latest).unwrap().len(), 2);
-        drop(store);
+        catalog(&reader);
+        global(&reader, 3, "later");
+        let (results, capped) = live(&reader, 3);
+        assert!(!capped);
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().any(|hit| hit.session.ends_with(A)));
+        assert!(results.iter().any(|hit| hit.session.ends_with(B)));
         fixture.close(reader);
     }
 
     #[test]
-    fn pages_and_documents_keep_their_versions_across_manual_refresh_and_reload() {
+    fn global_search_reports_whole_sessions_and_documents_keep_their_versions() {
         let fixture = Fixture::new(600, false);
         let reader = Runtime::new(fixture.data.clone());
         let (sessions, _) = catalog(&reader);
@@ -1541,19 +1586,16 @@ mod tests {
             .unwrap();
         let original = opened(&reader, 1);
         assert_eq!(original.len(), 600);
-        reader
-            .search(
-                1,
-                SearchQuery {
-                    text: "needle".into(),
-                    ..Default::default()
-                },
-                SearchCursor::default(),
-                Cancellation::default(),
-            )
-            .unwrap();
-        let (first, more, _) = hits(&reader, 1);
-        assert_eq!(first.len(), 512);
+        global(&reader, 1, "needle");
+        let (found, capped) = live(&reader, 1);
+        assert!(!capped);
+        assert_eq!(found.len(), 600);
+        assert!(found.iter().all(|hit| hit.snippet.contains("original")));
+        assert!(
+            found
+                .windows(2)
+                .all(|pair| pair[0].ordinal < pair[1].ordinal)
+        );
         fixture.append("needle addition");
         fixture.write_session(B, 1, "needle new member");
         reader
@@ -1565,19 +1607,6 @@ mod tests {
             .unwrap();
         let (updated, _) = catalog(&reader);
         assert_eq!(updated.len(), 2);
-        reader
-            .search(
-                1,
-                SearchQuery::default(),
-                more.unwrap(),
-                Cancellation::default(),
-            )
-            .unwrap();
-        let (last, more, total) = hits(&reader, 1);
-        assert_eq!(last.len(), 88);
-        assert_eq!(total, 600);
-        assert!(more.is_none());
-        assert!(last.iter().all(|hit| hit.snippet.contains("original")));
         reader
             .open(2, session.clone(), Cancellation::default())
             .unwrap();
@@ -1614,7 +1643,7 @@ mod tests {
                 Cancellation::default(),
             )
             .unwrap();
-        assert!(hits(&reader, 2).0.is_empty());
+        assert!(hits(&reader, 2).is_empty());
         reader
             .reload(3, session.clone(), Cancellation::default())
             .unwrap();
@@ -1631,37 +1660,18 @@ mod tests {
                 Cancellation::default(),
             )
             .unwrap();
-        assert_eq!(hits(&reader, 3).0.len(), 1);
+        assert_eq!(hits(&reader, 3).len(), 1);
         fixture.close(reader);
     }
 
     #[test]
-    fn query_waits_for_catalog_then_executes_once_and_old_hits_report_invalidation() {
+    fn search_starts_before_the_catalog_ends_and_old_hits_report_invalidation() {
         let fixture = Fixture::new(1, true);
         let reader = Runtime::new(fixture.data.clone());
-        reader
-            .search(
-                1,
-                SearchQuery {
-                    text: "needle".into(),
-                    ..Default::default()
-                },
-                SearchCursor::default(),
-                Cancellation::default(),
-            )
-            .unwrap();
-        let mut waited = false;
-        let event = next(&reader, |event| {
-            match event {
-                Event::SearchState {
-                    generation: 1,
-                    message,
-                } if message.contains("等待") => waited = true,
-                _ => {}
-            }
-            matches!(event, Event::Hits { generation: 1, .. })
-        });
-        assert!(waited);
+        // Sent while the first catalog run is still going; it does not wait for the run to end.
+        global(&reader, 1, "needle");
+        let (found, capped) = live(&reader, 1);
+        assert!(!capped);
         let terminal = Store::open(&fixture.data.join("index.sqlite"))
             .unwrap()
             .sessions(TimeMode::Latest)
@@ -1681,28 +1691,23 @@ mod tests {
                 .count(),
             1
         );
-        let Event::Hits { hits: results, .. } = event else {
-            unreachable!()
-        };
-        assert_eq!(results.len(), 1);
-        let old = results[0].clone();
+        assert_eq!(found.len(), 1);
+        let old = found[0].clone();
         fixture.write_session(A, 1, "replacement content");
         reader
-            .search(
-                2,
-                SearchQuery {
-                    text: "replacement".into(),
-                    ..Default::default()
-                },
-                SearchCursor::default(),
-                Cancellation::default(),
+            .refresh(
+                fixture.settings.sources.clone(),
+                Some(Vec::new()),
+                Some(Vec::new()),
             )
             .unwrap();
-        assert_eq!(hits(&reader, 2).0.len(), 1);
+        catalog(&reader);
+        global(&reader, 2, "replacement");
+        assert_eq!(live(&reader, 2).0.len(), 1);
         reader.validate_hit(1, old, false).unwrap();
         next(
             &reader,
-            |event| matches!(event, Event::Notice(message) if message.contains("失效")),
+            |event| matches!(event, Event::Notice(message) if message.contains("outdated")),
         );
         fixture.close(reader);
     }
@@ -1746,18 +1751,8 @@ mod tests {
                 1
             );
         }
-        reader
-            .search(
-                1,
-                SearchQuery {
-                    text: "needle".into(),
-                    ..Default::default()
-                },
-                SearchCursor::default(),
-                Cancellation::default(),
-            )
-            .unwrap();
-        assert!(hits(&reader, 1).0.is_empty());
+        global(&reader, 1, "needle");
+        assert!(live(&reader, 1).0.is_empty());
         fixture.close(reader);
     }
 
@@ -1765,7 +1760,7 @@ mod tests {
     fn cancelled_requests_do_not_publish_results_and_completed_snapshot_is_released_on_cancel() {
         let fixture = Fixture::new(1, false);
         let reader = Runtime::new(fixture.data.clone());
-        catalog(&reader);
+        let (sessions, _) = catalog(&reader);
         let cancelled = Cancellation::default();
         cancelled.cancel();
         reader
@@ -1779,26 +1774,38 @@ mod tests {
                 cancelled,
             )
             .unwrap();
+        global(&reader, 2, "needle");
+        let mut stale = false;
+        next(&reader, |event| {
+            if matches!(
+                event,
+                Event::SearchHits { generation: 1, .. } | Event::SearchDone { generation: 1, .. }
+            ) {
+                stale = true;
+            }
+            matches!(event, Event::SearchDone { generation: 2, .. })
+        });
+        assert!(!stale);
+        // A local find keeps its results in a snapshot until it is cancelled.
+        let session = sessions.iter().find(|session| session.available).unwrap();
+        reader
+            .open(1, session.clone(), Cancellation::default())
+            .unwrap();
+        opened(&reader, 1);
         let cancel = Cancellation::default();
         reader
             .search(
-                2,
+                3,
                 SearchQuery {
                     text: "needle".into(),
+                    session: Some(session.candidate.key.storage_key()),
                     ..Default::default()
                 },
                 SearchCursor::default(),
                 cancel.clone(),
             )
             .unwrap();
-        let mut stale = false;
-        next(&reader, |event| {
-            if matches!(event, Event::Hits { generation: 1, .. }) {
-                stale = true;
-            }
-            matches!(event, Event::Hits { generation: 2, .. })
-        });
-        assert!(!stale);
+        hits(&reader, 3);
         let snapshot_directory = fs::read_dir(&fixture.data)
             .unwrap()
             .map(|entry| entry.unwrap().path())
@@ -1809,10 +1816,12 @@ mod tests {
                     .starts_with("snapshots-")
             })
             .unwrap();
-        assert!(fs::read_dir(&snapshot_directory).unwrap().next().is_some());
+        // The open conversation keeps its own snapshot; only the find snapshot goes away.
+        let files = || fs::read_dir(&snapshot_directory).unwrap().count();
+        let before = files();
         cancel.cancel();
         let start = Instant::now();
-        while fs::read_dir(&snapshot_directory).unwrap().next().is_some() {
+        while files() >= before {
             assert!(
                 start.elapsed() < Duration::from_secs(3),
                 "Cancelled result cache was not released"
