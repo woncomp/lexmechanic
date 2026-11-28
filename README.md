@@ -37,7 +37,7 @@
 
 VS Code 重放 `kind=0/1/2` 的快照、赋值和数组追加，仅显示可见 request 的用户文本与助手文字片段，过滤隐藏 request 和工具片段。标题索引不可用时使用快照标题或首条用户内容。同一会话存在多个 transcript 副本时使用最后修改时间最新的一份并显示诊断。VS Code 时间从 request 的 `timestamp` / `responseTimestamp` 提取（毫秒时间戳），不会用标题索引的活动时间冒充首条助手消息时间。
 
-VS Code Agents 只显示在 Agents 窗口中创建的会话（`external=0`、未删除的默认对话）；宿主仅从磁盘发现的会话不重复列出。`workspace.yaml` 属于 `github/cli` 的会话仍归 Copilot CLI。标题取宿主目录的摘要，工作目录优先取转写日志中的路径。转写缺失但有标题的会话显示为不可读，无标题且无转写的空会话不显示。Codex 的 `.jsonl.zst` 归档以快照方式整体解压重放（解压上限 1 GiB）；Codex 为长线程另写的续页文件（`rollout-*-<thread>_<page>.jsonl`）暂不合并，仅显示诊断提示。Claude 子 Agent 的转写（`subagents\`）不并入主对话。
+VS Code Agents 只显示在 Agents 窗口中创建的会话（`external=0`、未删除的默认对话）；宿主仅从磁盘发现的会话不重复列出。`workspace.yaml` 属于 `github/cli` 的会话仍归 Copilot CLI。标题取宿主目录的摘要，工作目录优先取转写日志中的路径。转写缺失但有标题的会话显示为不可读，无标题且无转写的空会话不显示。Codex 的 `.jsonl.zst` 归档以快照方式整体解压重放（解压上限 1 GiB）；Codex 的长线程会续写到页文件（`rollout-*-<thread>_<page>.jsonl`）：以文件名时间最新的一页为会话文件，按每页首条记录 `history_base` 的 `thread_id` 与 `end_byte_offset` 逐级回溯，把更早文件截取到该偏移后依次拼接，页内被取代的尾部（如已中止的回合）不会显示；可跨越分叉到父线程。拼接后的会话按快照整体重放。找不到前序文件时只显示已有部分，并给出诊断提示。Claude 子 Agent 的转写（`subagents\`）不并入主对话。
 
 VS Code 追加 delta 可能改写已有回复，因此显式准备新内容时重放并重建该会话索引，不按 CLI 的纯追加消息处理。损坏的中间 delta 会明确报错，避免把不完整状态当作完整对话；未写完的最后一行不阻塞本轮，使用截止边界前的有效快照并提示下次手动读取重试。数据库均以只读方式打开，不再注册文件监听或替代轮询。
 

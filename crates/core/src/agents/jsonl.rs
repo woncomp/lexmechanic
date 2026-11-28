@@ -3,6 +3,10 @@
 //! Plain `.jsonl` files are streamed and resumed by byte cursor (`ReadMode::Append`). Compressed
 //! `.jsonl.zst` files are decoded whole and replayed as a snapshot (`ReadMode::Snapshot`); their
 //! message offsets address the decompressed stream while the batch cursor stays in file bytes.
+//!
+//! A history can also continue from earlier files (Codex pages): each earlier file contributes
+//! its first `limit` decoded bytes, then the candidate's own file follows. Such chains replay as
+//! one snapshot whose message offsets address the concatenated stream.
 
 use crate::model::*;
 use anyhow::{Context, Result};
@@ -10,7 +14,7 @@ use serde_json::Value;
 use std::{
     fs::File,
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 const PROBE_BYTES: usize = 512 * 1024;
@@ -24,6 +28,13 @@ const DECODED_LIMIT: u64 = 1024 * 1024 * 1024;
 pub(super) struct Header {
     pub created: Option<String>,
     pub workspace: Option<String>,
+}
+
+/// An earlier file of a chained history, read up to `limit` decoded bytes.
+#[derive(Clone, Debug)]
+pub(super) struct Segment {
+    pub path: PathBuf,
+    pub limit: u64,
 }
 
 pub(super) trait Format {
@@ -79,6 +90,55 @@ fn decode(path: &Path, size: u64) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Chains and compressed files replay whole; only a single plain file streams.
+fn is_snapshot(candidate: &Candidate, base: &[Segment]) -> bool {
+    !base.is_empty() || is_compressed(&candidate.events_path)
+}
+
+fn read_whole(path: &Path, size: u64) -> Result<Vec<u8>> {
+    if is_compressed(path) {
+        return decode(path, size);
+    }
+    let file =
+        File::open(path).with_context(|| format!("Cannot read transcript {}", path.display()))?;
+    anyhow::ensure!(
+        file.metadata()?.len() >= size,
+        "Transcript was truncated during this operation; refresh to retry"
+    );
+    let mut bytes = Vec::new();
+    file.take(size).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// The decoded stream of a snapshot: the base segments, then the candidate's own file.
+fn snapshot_bytes(candidate: &Candidate, base: &[Segment]) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    for segment in base {
+        let size = segment
+            .path
+            .metadata()
+            .with_context(|| format!("Cannot inspect {}", segment.path.display()))?
+            .len();
+        let mut part = read_whole(&segment.path, size)?;
+        part.truncate(usize::try_from(segment.limit)?);
+        // The next file must start on a fresh line even if this one was cut at its very end.
+        if part.last().is_some_and(|&byte| byte != b'\n') {
+            part.push(b'\n');
+        }
+        bytes.extend(part);
+        anyhow::ensure!(
+            bytes.len() as u64 <= DECODED_LIMIT,
+            "Chained transcript exceeds the 1 GiB decoded budget"
+        );
+    }
+    bytes.extend(read_whole(&candidate.events_path, candidate.size)?);
+    anyhow::ensure!(
+        bytes.len() as u64 <= DECODED_LIMIT,
+        "Chained transcript exceeds the 1 GiB decoded budget"
+    );
+    Ok(bytes)
+}
+
 fn first_line(text: &str) -> String {
     text.lines()
         .next()
@@ -90,6 +150,7 @@ fn first_line(text: &str) -> String {
 
 pub(super) fn summarize<F: Format>(
     candidate: &Candidate,
+    base: &[Segment],
     name: Option<String>,
     cancel: &Cancellation,
 ) -> Result<Session> {
@@ -106,14 +167,11 @@ pub(super) fn summarize<F: Format>(
         available: true,
         content_error: None,
     };
-    let compressed = is_compressed(&candidate.events_path);
+    let snapshot = is_snapshot(candidate, base);
     let mut header = Header::default();
     let mut latest = MessageTime::Missing;
-    let mut reader: Box<dyn BufRead> = if compressed {
-        Box::new(std::io::Cursor::new(decode(
-            &candidate.events_path,
-            candidate.size,
-        )?))
+    let mut reader: Box<dyn BufRead> = if snapshot {
+        Box::new(std::io::Cursor::new(snapshot_bytes(candidate, base)?))
     } else {
         Box::new(BufReader::new(
             File::open(&candidate.events_path)?.take(candidate.size),
@@ -144,14 +202,14 @@ pub(super) fn summarize<F: Format>(
                 {
                     summary.first_assistant = message.time;
                     // A plain file only needs its head; the tail is found separately.
-                    if !compressed {
+                    if !snapshot {
                         break;
                     }
                 }
             }
         }
         offset += count as u64;
-        if !compressed && offset >= PROBE_BYTES as u64 {
+        if !snapshot && offset >= PROBE_BYTES as u64 {
             break;
         }
     }
@@ -163,7 +221,7 @@ pub(super) fn summarize<F: Format>(
     if summary.name.is_empty() {
         summary.name = candidate.key.native.chars().take(8).collect();
     }
-    summary.latest = if compressed {
+    summary.latest = if snapshot {
         latest
     } else {
         match tail_time::<F>(&candidate.events_path, candidate.size, cancel)? {
@@ -177,6 +235,7 @@ pub(super) fn summarize<F: Format>(
 
 pub(super) fn read_batch<F: Format>(
     candidate: &Candidate,
+    base: &[Segment],
     cursor: u64,
     budget: usize,
     cancel: &Cancellation,
@@ -188,17 +247,17 @@ pub(super) fn read_batch<F: Format>(
         incomplete_tail: false,
         diagnostics: Vec::new(),
     };
-    if is_compressed(&candidate.events_path) {
+    if is_snapshot(candidate, base) {
         anyhow::ensure!(
             cursor == 0 || cursor == candidate.size,
-            "Compressed transcript changed; replay must restart from its snapshot"
+            "Transcript changed; replay must restart from its snapshot"
         );
         batch.cursor = candidate.size;
         batch.eof = true;
         if cursor != 0 {
             return Ok(batch);
         }
-        let bytes = decode(&candidate.events_path, candidate.size)?;
+        let bytes = snapshot_bytes(candidate, base)?;
         let mut offset = 0_u64;
         for line in bytes.split_inclusive(|&byte| byte == b'\n') {
             cancel.check()?;
@@ -261,6 +320,7 @@ fn invalid(candidate: &Candidate, offset: u64) -> Diagnostic {
 
 pub(super) fn original_message<F: Format>(
     candidate: &Candidate,
+    base: &[Segment],
     cached: &Message,
 ) -> Result<String> {
     let length = usize::try_from(cached.end.saturating_sub(cached.offset))?;
@@ -268,8 +328,8 @@ pub(super) fn original_message<F: Format>(
         length <= 128 * 1024 * 1024,
         "Raw event exceeds the 128 MiB view budget; inspect the source file instead"
     );
-    let bytes = if is_compressed(&candidate.events_path) {
-        let decoded = decode(&candidate.events_path, candidate.size)?;
+    let bytes = if is_snapshot(candidate, base) {
+        let decoded = snapshot_bytes(candidate, base)?;
         let start = usize::try_from(cached.offset)?;
         decoded
             .get(start..start + length)

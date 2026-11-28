@@ -35,6 +35,13 @@ const CODEX_THREAD: &str = "30000000-0000-4000-8000-0000000000a1";
 const CODEX_ZST: &str = "30000000-0000-4000-8000-000000000002";
 const CODEX_ZST_THREAD: &str = "30000000-0000-4000-8000-0000000000a2";
 const CODEX_PAGE: &str = "30000000-0000-4000-8000-0000000000b1";
+const CODEX_PAGE2: &str = "30000000-0000-4000-8000-0000000000b2";
+const CODEX_ORPHAN: &str = "30000000-0000-4000-8000-000000000003";
+const CODEX_ORPHAN_THREAD: &str = "30000000-0000-4000-8000-0000000000a3";
+const CODEX_REWRITE: &str = "30000000-0000-4000-8000-000000000004";
+const CODEX_REWRITE_THREAD: &str = "30000000-0000-4000-8000-0000000000a4";
+const CODEX_REWRITE_PAGE: &str = "30000000-0000-4000-8000-0000000000b3";
+const CODEX_UNKNOWN: &str = "30000000-0000-4000-8000-0000000000c1";
 
 fn write_lines(path: &Path, lines: &[Value]) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -231,6 +238,28 @@ impl Fixtures {
                 "codex",
                 false,
             ),
+            (
+                row(
+                    &format!("codex:/{CODEX_ORPHAN}"),
+                    0,
+                    Some("Orphan page"),
+                    None,
+                    "file:///d%3A/codex-orphan",
+                ),
+                "codex",
+                false,
+            ),
+            (
+                row(
+                    &format!("codex:/{CODEX_REWRITE}"),
+                    0,
+                    Some("Rewritten codex"),
+                    None,
+                    "file:///d%3A/codex-rewrite",
+                ),
+                "codex",
+                false,
+            ),
         ];
         let rows: Vec<_> = rows
             .iter()
@@ -323,18 +352,110 @@ impl Fixtures {
         };
         thread_store(CODEX, CODEX_THREAD);
         thread_store(CODEX_ZST, CODEX_ZST_THREAD);
+        thread_store(CODEX_ORPHAN, CODEX_ORPHAN_THREAD);
+        thread_store(CODEX_REWRITE, CODEX_REWRITE_THREAD);
+
+        // Long threads continue in pages: a page starts with the file it continues and the byte
+        // where that file's share of the history ends; whatever follows that point is replaced.
+        let item = |ordinal: u64, kind: &str, text: &str| -> Value {
+            let part = if kind == "UserMessage" {
+                "text"
+            } else {
+                "Text"
+            };
+            json!({"type": "event_msg", "timestamp": format!("2026-11-20T03:49:{ordinal:02}.000Z"),
+                "ordinal": ordinal,
+                "payload": {"type": "item_completed", "item": {"type": kind, "id": format!("i{ordinal}"),
+                    "content": [{"type": part, "text": text}]}}})
+        };
+        let meta = |ordinal: u64, base: Option<Value>| -> Value {
+            let mut payload = json!({"id": CODEX_THREAD, "timestamp": "2026-11-20T03:48:02.389Z",
+                "cwd": "d:\\transcript\\codex"});
+            if let Some(base) = base {
+                payload["history_base"] = base;
+            }
+            json!({"type": "session_meta", "timestamp": "2026-11-20T03:48:02.389Z",
+                "ordinal": ordinal, "payload": payload})
+        };
+        let offset = |lines: &[Value], index: usize| -> u64 {
+            lines[..index]
+                .iter()
+                .map(|line| format!("{line}\n").len() as u64)
+                .sum()
+        };
+        let mut main = rollout(CODEX_THREAD, "codex 中文 prompt");
+        main.push(item(4, "UserMessage", "aborted prompt"));
+        let page = vec![
+            meta(
+                4,
+                Some(
+                    json!({"thread_id": CODEX_THREAD, "end_ordinal_exclusive": 4,
+                "end_byte_offset": offset(&main, 4)}),
+                ),
+            ),
+            item(5, "UserMessage", "page prompt"),
+            item(6, "AgentMessage", "page reply"),
+            item(7, "UserMessage", "abandoned prompt"),
+        ];
+        let second = vec![
+            meta(
+                7,
+                Some(json!({"thread_id": CODEX_PAGE, "end_ordinal_exclusive": 7,
+                "end_byte_offset": offset(&page, 3)})),
+            ),
+            item(8, "UserMessage", "second page prompt"),
+            item(9, "AgentMessage", "second page reply"),
+        ];
+        let day = homes.codex.join("sessions/2026/11/20");
         write_lines(
-            &homes
-                .codex
-                .join("sessions/2026/11/20")
-                .join(format!("rollout-2026-11-20T11-48-02-{CODEX_THREAD}.jsonl")),
-            &rollout(CODEX_THREAD, "codex 中文 prompt"),
+            &day.join(format!("rollout-2026-11-20T11-48-02-{CODEX_THREAD}.jsonl")),
+            &main,
         );
         write_lines(
-            &homes.codex.join("sessions/2026/11/20").join(format!(
+            &day.join(format!(
                 "rollout-2026-11-20T14-02-21-{CODEX_THREAD}_{CODEX_PAGE}.jsonl"
             )),
-            &rollout(CODEX_THREAD, "continuation page prompt"),
+            &page,
+        );
+        write_lines(
+            &day.join(format!(
+                "rollout-2026-11-20T15-10-00-{CODEX_THREAD}_{CODEX_PAGE2}.jsonl"
+            )),
+            &second,
+        );
+        // A page whose base file is gone shows what it has, with a warning.
+        write_lines(
+            &day.join(format!(
+                "rollout-2026-11-20T16-00-00-{CODEX_ORPHAN_THREAD}.jsonl"
+            )),
+            &[
+                meta(
+                    10,
+                    Some(
+                        json!({"thread_id": CODEX_UNKNOWN, "end_ordinal_exclusive": 10,
+                    "end_byte_offset": 100}),
+                    ),
+                ),
+                item(10, "UserMessage", "orphan prompt"),
+                item(11, "AgentMessage", "orphan reply"),
+            ],
+        );
+        // Without a history base the newest file stands alone, whatever an older one held.
+        write_lines(
+            &day.join(format!(
+                "rollout-2026-11-20T09-00-00-{CODEX_REWRITE_THREAD}.jsonl"
+            )),
+            &[meta(0, None), item(1, "UserMessage", "stale prompt")],
+        );
+        write_lines(
+            &day.join(format!(
+                "rollout-2026-11-20T09-30-00-{CODEX_REWRITE_THREAD}_{CODEX_REWRITE_PAGE}.jsonl"
+            )),
+            &[
+                meta(0, None),
+                item(1, "UserMessage", "fresh prompt"),
+                item(2, "AgentMessage", "fresh reply"),
+            ],
         );
         let plain: String = rollout(CODEX_ZST_THREAD, "archived 中文 prompt")
             .iter()
@@ -462,28 +583,84 @@ fn codex_resolves_threads_through_the_host_store_including_archived_compressed_r
     let fixtures = Fixtures::new();
     let (adapter, found) = fixtures.discovered(Driver::Codex);
     let natives: Vec<_> = found.iter().map(|c| c.key.native.as_str()).collect();
-    assert_eq!(natives, [CODEX, CODEX_ZST]);
+    assert_eq!(natives, [CODEX, CODEX_ZST, CODEX_ORPHAN, CODEX_REWRITE]);
 
-    let plain = &found[0];
-    assert_eq!(plain.read_mode, ReadMode::Append);
-    let report = adapter.discover(&Cancellation::default()).unwrap();
+    // The thread continues in two pages: the main file up to where page one begins, page one up
+    // to where page two begins, then page two. Aborted and abandoned records are replaced.
+    let paged = &found[0];
+    assert_eq!(paged.read_mode, ReadMode::Snapshot);
     assert!(
-        report
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.description.contains("continuation page")),
-        "the unmerged continuation page must be reported"
+        paged
+            .events_path
+            .to_string_lossy()
+            .contains(&format!("_{CODEX_PAGE2}")),
+        "the newest page is the session's file"
     );
-    let session = adapter.summarize(plain, &Cancellation::default()).unwrap();
+    let session = adapter.summarize(paged, &Cancellation::default()).unwrap();
     assert_eq!(session.name, "Agents codex");
     assert_eq!(session.workspace.as_deref(), Some("d:\\transcript\\codex"));
-    let content: Vec<_> = fixtures
-        .messages(Driver::Codex, plain)
+    assert_eq!(
+        session.created.value().unwrap().to_rfc3339(),
+        "2026-11-20T03:48:02.389+00:00"
+    );
+    assert_eq!(
+        session.latest.value().unwrap().to_rfc3339(),
+        "2026-11-20T03:49:09+00:00"
+    );
+    let messages = fixtures.messages(Driver::Codex, paged);
+    let content: Vec<_> = messages.iter().map(|m| m.content.as_str()).collect();
+    // The injected AGENTS.md message never appears either.
+    assert_eq!(
+        content,
+        [
+            "codex 中文 prompt",
+            "codex reply",
+            "page prompt",
+            "page reply",
+            "second page prompt",
+            "second page reply"
+        ]
+    );
+    // Offsets address the concatenated history, so every message's raw text stays reachable.
+    let opened = agents::adapter_for(paged).unwrap();
+    for message in &messages {
+        assert_eq!(
+            opened.original_message(paged, message).unwrap(),
+            message.content
+        );
+    }
+    // Opening a session probes it again; an unchanged history must look unchanged.
+    assert_eq!(
+        &adapter.probe(paged, &Cancellation::default()).unwrap(),
+        paged
+    );
+    // The paged thread is complete, so only the orphan reports a problem.
+    let report = adapter.discover(&Cancellation::default()).unwrap();
+    assert_eq!(report.diagnostics.len(), 1);
+    assert!(report.diagnostics[0].description.contains("not on disk"));
+    assert!(
+        report.diagnostics[0]
+            .path
+            .to_string_lossy()
+            .contains(CODEX_ORPHAN_THREAD)
+    );
+
+    let orphan = &found[2];
+    let orphan_content: Vec<_> = fixtures
+        .messages(Driver::Codex, orphan)
         .into_iter()
         .map(|message| message.content)
         .collect();
-    // The injected AGENTS.md message and the continuation page are not part of the conversation.
-    assert_eq!(content, ["codex 中文 prompt", "codex reply"]);
+    assert_eq!(orphan_content, ["orphan prompt", "orphan reply"]);
+
+    let rewritten = &found[3];
+    assert_eq!(rewritten.read_mode, ReadMode::Append);
+    let rewritten_content: Vec<_> = fixtures
+        .messages(Driver::Codex, rewritten)
+        .into_iter()
+        .map(|message| message.content)
+        .collect();
+    assert_eq!(rewritten_content, ["fresh prompt", "fresh reply"]);
 
     let archived = &found[1];
     assert_eq!(archived.read_mode, ReadMode::Snapshot);
@@ -557,9 +734,9 @@ fn all_three_drivers_scan_into_one_index_without_writing_the_host_databases() {
     drop(handle);
     let store = Store::open(&fixtures.index).unwrap();
     let sessions = store.sessions(TimeMode::Latest).unwrap();
-    // copilot + removed copilot + claude + two codex.
-    assert_eq!(sessions.len(), 5);
-    assert_eq!(sessions.iter().filter(|session| session.indexed).count(), 4);
+    // copilot + removed copilot + claude + four codex.
+    assert_eq!(sessions.len(), 7);
+    assert_eq!(sessions.iter().filter(|session| session.indexed).count(), 6);
     assert_eq!(
         sessions.iter().filter(|session| !session.available).count(),
         1

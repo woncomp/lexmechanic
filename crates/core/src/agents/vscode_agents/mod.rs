@@ -12,11 +12,12 @@ mod codex;
 use super::{AgentAdapter, candidate, copilot_cli, jsonl, source};
 use crate::model::*;
 use anyhow::{Context, Result};
-use catalog::Entry;
+use catalog::{Entry, Rollouts};
+use jsonl::Segment;
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 pub use catalog::catalog_path;
@@ -93,6 +94,9 @@ pub struct VsCodeAgents {
     driver: Driver,
     homes: Homes,
     records: Mutex<HashMap<String, Record>>,
+    /// Codex rollouts as of the last discovery, and the history chain resolved for each head.
+    rollouts: Mutex<Option<Arc<Rollouts>>>,
+    chains: Mutex<HashMap<PathBuf, Vec<Segment>>>,
 }
 
 const MISSING: &str = "Local session transcript was not found";
@@ -104,6 +108,8 @@ impl VsCodeAgents {
             driver,
             homes,
             records: Mutex::new(HashMap::new()),
+            rollouts: Mutex::new(None),
+            chains: Mutex::new(HashMap::new()),
         })
     }
 
@@ -130,15 +136,93 @@ impl VsCodeAgents {
                 codex: PathBuf::new(),
             },
             records: Mutex::new(HashMap::new()),
+            rollouts: Mutex::new(None),
+            chains: Mutex::new(HashMap::new()),
         })
     }
 
-    /// Transcripts by session id, plus the sessions another adapter already lists.
-    fn transcripts(
+    /// The Codex data directory: the configured one, else the one that holds this rollout.
+    fn codex_home(&self, rollout: &Path) -> Option<PathBuf> {
+        if !self.homes.codex.as_os_str().is_empty() {
+            return Some(self.homes.codex.clone());
+        }
+        let folder = rollout.parent()?.file_name()?;
+        let home = if folder == "archived_sessions" {
+            rollout.ancestors().nth(2)?
+        } else {
+            // sessions/<year>/<month>/<day>/rollout-*.jsonl
+            let sessions = rollout.ancestors().nth(4)?;
+            if sessions.file_name()? != "sessions" {
+                return None;
+            }
+            sessions.parent()?
+        };
+        Some(home.to_owned())
+    }
+
+    fn rollouts(&self, rollout: &Path) -> Result<Arc<Rollouts>> {
+        let mut cached = self
+            .rollouts
+            .lock()
+            .map_err(|_| anyhow::anyhow!("VS Code Agents rollout index failed"))?;
+        if let Some(index) = cached.as_ref() {
+            return Ok(index.clone());
+        }
+        let home = self
+            .codex_home(rollout)
+            .context("Cannot locate the Codex data directory for this rollout")?;
+        Ok(cached
+            .insert(Arc::new(catalog::codex_rollouts(&home)))
+            .clone())
+    }
+
+    /// The earlier files that a Codex rollout continues from, oldest first, and a warning when
+    /// the history could not be completed. `rescan` re-reads the files' own history markers.
+    fn base(&self, rollout: &Path, rescan: bool) -> Result<(Vec<Segment>, Option<String>)> {
+        if self.driver != Driver::Codex {
+            return Ok((Vec::new(), None));
+        }
+        if !rescan
+            && let Some(base) = self
+                .chains
+                .lock()
+                .map_err(|_| anyhow::anyhow!("VS Code Agents history chain failed"))?
+                .get(rollout)
+        {
+            return Ok((base.clone(), None));
+        }
+        let index = self.rollouts(rollout)?;
+        let chain = catalog::chain(&index, rollout);
+        self.chains
+            .lock()
+            .map_err(|_| anyhow::anyhow!("VS Code Agents history chain failed"))?
+            .insert(rollout.to_owned(), chain.base.clone());
+        Ok((chain.base, chain.warning))
+    }
+
+    /// The session's candidate: its own file, with the change time of everything it replays.
+    fn build_candidate(
         &self,
-        entries: &[Entry],
-        diagnostics: &mut Vec<Diagnostic>,
-    ) -> (HashMap<String, PathBuf>, HashSet<String>) {
+        native: &str,
+        path: &Path,
+        rescan: bool,
+    ) -> Result<(Candidate, Option<String>)> {
+        let (base, warning) = self.base(path, rescan)?;
+        let mode = if base.is_empty() && !jsonl::is_compressed(path) {
+            ReadMode::Append
+        } else {
+            ReadMode::Snapshot
+        };
+        let mut found = candidate(&self.source, native.to_owned(), path, mode)?;
+        for segment in &base {
+            let earlier = candidate(&self.source, native.to_owned(), &segment.path, mode)?;
+            found.modified_ns = found.modified_ns.max(earlier.modified_ns);
+        }
+        Ok((found, warning))
+    }
+
+    /// Transcripts by session id, plus the sessions another adapter already lists.
+    fn transcripts(&self, entries: &[Entry]) -> (HashMap<String, PathBuf>, HashSet<String>) {
         let user_root = &self.source.root;
         let mut found = HashMap::new();
         let mut foreign = HashSet::new();
@@ -173,24 +257,22 @@ impl VsCodeAgents {
                 }
             }
             Driver::Codex => {
-                let rollouts = catalog::codex_rollouts(&self.homes.codex);
+                // Each discovery starts from what is on disk now.
+                let rollouts = Arc::new(catalog::codex_rollouts(&self.homes.codex));
+                if let Ok(mut cached) = self.rollouts.lock() {
+                    *cached = Some(rollouts.clone());
+                }
+                if let Ok(mut chains) = self.chains.lock() {
+                    chains.clear();
+                }
                 for entry in entries {
                     let Some(thread) = catalog::codex_thread(user_root, &entry.id) else {
                         continue;
                     };
-                    let Some(path) = rollouts.primary.get(&thread) else {
-                        continue;
-                    };
-                    if let Some(pages) = rollouts.pages.get(&thread) {
-                        diagnostics.push(Diagnostic {
-                            path: path.clone(),
-                            offset: None,
-                            description: format!(
-                                "Codex stored {pages} continuation page(s) for this thread in separate files; only the first file is shown"
-                            ),
-                        });
+                    // The newest page holds the thread's latest history; `base` finds the rest.
+                    if let Some(path) = rollouts.heads.get(&thread) {
+                        found.insert(entry.id.clone(), path.clone());
                     }
-                    found.insert(entry.id.clone(), path.clone());
                 }
             }
         }
@@ -216,18 +298,15 @@ impl AgentAdapter for VsCodeAgents {
         cancel.check()?;
         // A missing transcript is represented by the catalog file, which must never be read as one.
         anyhow::ensure!(is_transcript(&previous.events_path), MISSING);
-        candidate(
-            &self.source,
-            previous.key.native.clone(),
-            &previous.events_path,
-            previous.read_mode,
-        )
+        Ok(self
+            .build_candidate(&previous.key.native, &previous.events_path, true)?
+            .0)
     }
 
     fn discover(&self, cancel: &Cancellation) -> Result<Discovery> {
         let entries = catalog::entries(&self.source.root, self.driver, cancel)?;
         let mut diagnostics = Vec::new();
-        let (transcripts, foreign) = self.transcripts(&entries, &mut diagnostics);
+        let (transcripts, foreign) = self.transcripts(&entries);
         let mut records = HashMap::new();
         let mut candidates = Vec::new();
         for entry in entries {
@@ -240,12 +319,15 @@ impl AgentAdapter for VsCodeAgents {
             }
             let found = match transcripts.get(&entry.id) {
                 Some(path) => {
-                    let mode = if jsonl::is_compressed(path) {
-                        ReadMode::Snapshot
-                    } else {
-                        ReadMode::Append
-                    };
-                    candidate(&self.source, entry.id.clone(), path, mode)
+                    self.build_candidate(&entry.id, path, false)
+                        .map(|(found, warning)| {
+                            diagnostics.extend(warning.map(|description| Diagnostic {
+                                path: path.clone(),
+                                offset: None,
+                                description,
+                            }));
+                            found
+                        })
                 }
                 // The catalog outlives deleted transcripts; keep the row but mark it unreadable.
                 None => candidate(
@@ -305,8 +387,13 @@ impl AgentAdapter for VsCodeAgents {
         }
         let mut session = match self.driver {
             Driver::Copilot => copilot_cli::summarize_log(candidate, record.title, cancel)?,
-            Driver::Claude => jsonl::summarize::<claude::Claude>(candidate, record.title, cancel)?,
-            Driver::Codex => jsonl::summarize::<codex::Codex>(candidate, record.title, cancel)?,
+            Driver::Claude => {
+                jsonl::summarize::<claude::Claude>(candidate, &[], record.title, cancel)?
+            }
+            Driver::Codex => {
+                let (base, _) = self.base(&candidate.events_path, false)?;
+                jsonl::summarize::<codex::Codex>(candidate, &base, record.title, cancel)?
+            }
         };
         // The transcript knows the working directory in the same form as the other agents.
         session.workspace = session.workspace.or(record.workspace);
@@ -323,17 +410,23 @@ impl AgentAdapter for VsCodeAgents {
         match self.driver {
             Driver::Copilot => copilot_cli::read_log(candidate, cursor, budget, cancel),
             Driver::Claude => {
-                jsonl::read_batch::<claude::Claude>(candidate, cursor, budget, cancel)
+                jsonl::read_batch::<claude::Claude>(candidate, &[], cursor, budget, cancel)
             }
-            Driver::Codex => jsonl::read_batch::<codex::Codex>(candidate, cursor, budget, cancel),
+            Driver::Codex => {
+                let (base, _) = self.base(&candidate.events_path, false)?;
+                jsonl::read_batch::<codex::Codex>(candidate, &base, cursor, budget, cancel)
+            }
         }
     }
 
     fn original_message(&self, candidate: &Candidate, cached: &Message) -> Result<String> {
         match self.driver {
             Driver::Copilot => copilot_cli::original_message(&candidate.events_path, cached),
-            Driver::Claude => jsonl::original_message::<claude::Claude>(candidate, cached),
-            Driver::Codex => jsonl::original_message::<codex::Codex>(candidate, cached),
+            Driver::Claude => jsonl::original_message::<claude::Claude>(candidate, &[], cached),
+            Driver::Codex => {
+                let (base, _) = self.base(&candidate.events_path, false)?;
+                jsonl::original_message::<codex::Codex>(candidate, &base, cached)
+            }
         }
     }
 }

@@ -1,12 +1,14 @@
 //! Reads the VS Code agent host's catalog and locates each session's native transcript.
 
 use super::Driver;
+use crate::agents::jsonl::{Segment, is_compressed};
 use crate::{agents::open_read_only, model::*};
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
+    io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
 };
 
@@ -174,12 +176,13 @@ pub(super) fn codex_thread(user_root: &Path, session: &str) -> Option<String> {
 
 #[derive(Default)]
 pub(super) struct Rollouts {
-    pub primary: HashMap<String, PathBuf>,
-    /// Continuation pages (`…-<thread>_<page>.jsonl`) that the reader does not merge in.
-    pub pages: HashMap<String, usize>,
+    /// Every rollout file by its own id: the thread id for a first file, the page id for a page.
+    pub files: HashMap<String, PathBuf>,
+    /// The newest file of each thread, which holds its latest history.
+    pub heads: HashMap<String, PathBuf>,
 }
 
-/// Indexes `sessions/Y/M/D/` and `archived_sessions/` rollouts by thread id.
+/// Indexes `sessions/Y/M/D/` and `archived_sessions/` rollouts.
 pub(super) fn codex_rollouts(home: &Path) -> Rollouts {
     let mut directories = vec![home.join("archived_sessions")];
     for years in fs::read_dir(home.join("sessions"))
@@ -194,7 +197,8 @@ pub(super) fn codex_rollouts(home: &Path) -> Rollouts {
         }
     }
     let mut rollouts = Rollouts::default();
-    // Active sessions come first so that they win over an archived copy of the same thread.
+    let mut newest: HashMap<String, (String, PathBuf)> = HashMap::new();
+    // Active sessions come first so that they win over an archived copy of the same file.
     directories.rotate_left(1);
     for directory in directories {
         for file in fs::read_dir(directory).into_iter().flatten().flatten() {
@@ -209,33 +213,115 @@ pub(super) fn codex_rollouts(home: &Path) -> Rollouts {
             else {
                 continue;
             };
-            match thread_of(stem) {
-                Some((thread, false)) => {
-                    rollouts.primary.entry(thread).or_insert(path);
-                }
-                Some((thread, true)) => *rollouts.pages.entry(thread).or_default() += 1,
-                None => {}
+            let Some((thread, own)) = ids_of(stem) else {
+                continue;
+            };
+            rollouts.files.entry(own).or_insert_with(|| path.clone());
+            // Names start with the creation time, so the greatest name is the latest page.
+            if newest
+                .get(&thread)
+                .is_none_or(|(latest, _)| stem > latest.as_str())
+            {
+                newest.insert(thread, (stem.to_owned(), path));
             }
         }
     }
+    rollouts.heads = newest
+        .into_iter()
+        .map(|(thread, (_, path))| (thread, path))
+        .collect();
     rollouts
 }
 
-/// Splits `<timestamp>-<thread>` or `<timestamp>-<thread>_<page>` into the thread and whether
-/// the file is a continuation page.
-fn thread_of(stem: &str) -> Option<(String, bool)> {
+/// Splits `<timestamp>-<thread>` or `<timestamp>-<thread>_<page>` into the thread id and the
+/// file's own id (the page id for a page, otherwise the thread id).
+fn ids_of(stem: &str) -> Option<(String, String)> {
     let uuid = |end: usize| {
         let start = end.checked_sub(36)?;
         let candidate = stem.get(start..end)?;
-        (uuid::Uuid::parse_str(candidate).is_ok() && stem.get(..start)?.ends_with('-'))
+        (uuid::Uuid::parse_str(candidate).is_ok() && stem.get(..start)?.ends_with(['-', '_']))
             .then(|| candidate.to_lowercase())
     };
-    if let Some(thread) = uuid(stem.len()) {
-        return Some((thread, false));
+    let last = uuid(stem.len())?;
+    if stem.get(..stem.len() - 36)?.ends_with('-') {
+        return Some((last.clone(), last));
     }
-    let page = stem.get(stem.len().checked_sub(37)?..)?;
-    page.starts_with('_').then_some(())?;
-    uuid(stem.len() - 37).map(|thread| (thread, true))
+    // `…-<thread>_<page>`: the character before the page uuid is the underscore.
+    let thread = uuid(stem.len() - 37)?;
+    Some((thread, last))
+}
+
+/// The earlier files that a rollout's history continues from, oldest first.
+pub(super) struct Chain {
+    pub base: Vec<Segment>,
+    /// Set when the history could not be completed, so the reader shows only part of it.
+    pub warning: Option<String>,
+}
+
+pub(super) fn chain(rollouts: &Rollouts, head: &Path) -> Chain {
+    let mut base = Vec::new();
+    let mut seen = HashSet::from([head.to_owned()]);
+    let mut current = head.to_owned();
+    let warning = loop {
+        let (from, limit) = match history_base(&current) {
+            Ok(Some(found)) => found,
+            Ok(None) => break None,
+            Err(error) => {
+                break Some(format!(
+                    "Cannot read the history base of this rollout: {error:#}"
+                ));
+            }
+        };
+        let Some(path) = rollouts.files.get(&from) else {
+            break Some(format!(
+                "Codex history continues from {from}, which is not on disk; only the later part is shown"
+            ));
+        };
+        if base.len() >= 32 || !seen.insert(path.clone()) {
+            break Some(
+                "Codex history chain is cyclic or too long; only part of it is shown".into(),
+            );
+        }
+        base.push(Segment {
+            path: path.clone(),
+            limit,
+        });
+        current = path.clone();
+    };
+    base.reverse();
+    Chain { base, warning }
+}
+
+/// `history_base` of the rollout's first record: the file it continues and where that file's
+/// share of the history ends.
+fn history_base(path: &Path) -> Result<Option<(String, u64)>> {
+    let file = fs::File::open(path)?;
+    let mut reader: Box<dyn BufRead> = if is_compressed(path) {
+        let decoder = ruzstd::decoding::StreamingDecoder::new(file)
+            .map_err(|error| anyhow::anyhow!("Cannot decompress: {error}"))?;
+        Box::new(BufReader::new(decoder))
+    } else {
+        Box::new(BufReader::new(file))
+    };
+    let mut line = Vec::new();
+    // The first record carries the whole system prompt, but never approaches this bound.
+    (&mut reader)
+        .take(16 * 1024 * 1024)
+        .read_until(b'\n', &mut line)?;
+    let record: Value = serde_json::from_slice(&line).context("Invalid first record")?;
+    let Some(base) = record.pointer("/payload/history_base") else {
+        return Ok(None);
+    };
+    let thread = base
+        .get("thread_id")
+        .and_then(Value::as_str)
+        .context("history_base has no thread_id")?
+        .to_lowercase();
+    let offset = base
+        .get("end_byte_offset")
+        .and_then(Value::as_u64)
+        .context("history_base has no end_byte_offset")?;
+    Ok(Some((thread, offset)))
 }
 
 #[cfg(test)]
@@ -255,17 +341,18 @@ mod tests {
     }
 
     #[test]
-    fn rollout_names_map_to_threads_and_pages() {
+    fn rollout_names_map_to_threads_and_own_ids() {
         let thread = "01a1f711-81a5-7723-ad58-21611e1d29db";
         let page = "01a1f78c-7b37-70a1-ad85-0e71e723a7e5";
+        // A first file is its own thread; a page belongs to the thread but has its own id.
         assert_eq!(
-            thread_of(&format!("2026-11-20T11-48-02-{thread}")),
-            Some((thread.into(), false))
+            ids_of(&format!("2026-11-20T11-48-02-{thread}")),
+            Some((thread.into(), thread.into()))
         );
         assert_eq!(
-            thread_of(&format!("2026-11-20T14-02-21-{thread}_{page}")),
-            Some((thread.into(), true))
+            ids_of(&format!("2026-11-20T14-02-21-{thread}_{page}")),
+            Some((thread.into(), page.into()))
         );
-        assert_eq!(thread_of("2026-11-20T14-02-21-not-a-uuid"), None);
+        assert_eq!(ids_of("2026-11-20T14-02-21-not-a-uuid"), None);
     }
 }
