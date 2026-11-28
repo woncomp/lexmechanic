@@ -30,6 +30,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "message_rail.rs"]
+pub(crate) mod message_rail;
+
 actions!(
     reader,
     [
@@ -100,6 +103,7 @@ pub struct Workbench {
     jump_input: Entity<InputState>,
     focus: FocusHandle,
     doc_focus: FocusHandle,
+    rail_focus: FocusHandle,
     focus_document: bool,
     generation: u64,
     doc_cancel: Cancellation,
@@ -148,6 +152,7 @@ impl Workbench {
             InputState::new(window, cx).placeholder("Find in conversation  ·  Enter / F3")
         });
         let jump_input = cx.new(|cx| InputState::new(window, cx).placeholder("Message #"));
+        let rail_focus = cx.focus_handle().tab_stop(true);
         let owner = cx.weak_entity();
         let table = cx.new(|cx| {
             TableState::new(
@@ -170,6 +175,24 @@ impl Workbench {
             .col_movable(false)
         });
         let mut subscriptions = Vec::new();
+        subscriptions.push(cx.on_focus(&rail_focus, window, |this, _, cx| {
+            if let Some(document) = &mut this.document {
+                document.rail.focus(
+                    document
+                        .messages
+                        .get(document.current)
+                        .map(|message| message.info.rowid),
+                );
+                cx.notify();
+            }
+        }));
+        subscriptions.push(cx.on_blur(&rail_focus, window, |this, _, cx| {
+            if let Some(document) = &mut this.document {
+                document.rail.blur();
+                document.follow_current();
+                cx.notify();
+            }
+        }));
         subscriptions.push(cx.observe_window_appearance(window, |this, window, cx| {
             if this.settings.dark.is_none() {
                 Theme::sync_system_appearance(Some(window), cx);
@@ -324,6 +347,7 @@ impl Workbench {
             jump_input,
             focus,
             doc_focus: cx.focus_handle(),
+            rail_focus,
             focus_document: false,
             generation: 0,
             doc_cancel: Cancellation::default(),
@@ -622,9 +646,7 @@ impl Workbench {
                                 && let Some(row) = document.rows.get(event.visible_range.start)
                             {
                                 document.current = row.message;
-                                document
-                                    .nav_scroll
-                                    .scroll_to_item(row.message, ScrollStrategy::Center);
+                                document.follow_current();
                             }
                             this.save_due = Some(Instant::now() + Duration::from_secs(1));
                             cx.notify();
@@ -1085,9 +1107,7 @@ impl Workbench {
                     item_ix: index,
                     offset_in_item: px(0.),
                 });
-                document
-                    .nav_scroll
-                    .scroll_to_item(ordinal, ScrollStrategy::Center);
+                document.follow_current();
                 document.reveal = Some((
                     document.messages[ordinal].info.rowid,
                     part,
@@ -1594,70 +1614,13 @@ impl Workbench {
         }
         let list_state = document.list.clone();
         let message_count = document.messages.len();
-        let nav_scroll = document.nav_scroll.clone();
         let current = document.current;
         let owner = cx.entity();
         let body = list(list_state, move |index, window, cx| {
             owner.update(cx, |this, cx| this.render_message(index, window, cx))
         })
         .size_full();
-        let nav = uniform_list(
-            "message-navigation",
-            message_count,
-            cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
-                range
-                    .map(|index| {
-                        let role = this
-                            .document
-                            .as_ref()
-                            .and_then(|document| document.messages.get(index))
-                            .map(|message| message.info.role)
-                            .unwrap_or(Role::Assistant);
-                        let hit = this.hits.iter().any(|hit| {
-                            Some(&hit.session) == this.tabs.active.as_ref()
-                                && this
-                                    .document
-                                    .as_ref()
-                                    .and_then(|document| document.messages.get(index))
-                                    .is_some_and(|message| message.info.rowid == hit.message_id)
-                        });
-                        div()
-                            .id(("nav-message", index))
-                            .h(px(18.))
-                            .w(px(40.))
-                            .p_1()
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(document) = &mut this.document {
-                                    document.jump(index);
-                                }
-                                cx.notify();
-                            }))
-                            .child(
-                                div()
-                                    .w_full()
-                                    .h(px(6.))
-                                    .rounded_sm()
-                                    .bg(if index == current {
-                                        cx.theme().primary
-                                    } else if hit {
-                                        cx.theme().warning
-                                    } else if role == Role::User {
-                                        cx.theme().muted_foreground
-                                    } else {
-                                        cx.theme().border
-                                    })
-                                    .when(index == current, |bar| {
-                                        bar.border_1().border_color(cx.theme().foreground)
-                                    }),
-                            )
-                    })
-                    .collect()
-            }),
-        )
-        .track_scroll(&nav_scroll)
-        .h_full()
-        .w(px(40.));
+        let nav = (message_count > 0).then(|| self.render_message_rail(cx));
         v_flex()
             .size_full()
             .min_h_0()
@@ -1794,13 +1757,7 @@ impl Workbench {
                     .flex_1()
                     .min_h_0()
                     .child(div().flex_1().min_w_0().h_full().child(body))
-                    .child(
-                        div()
-                            .h_full()
-                            .border_l_1()
-                            .border_color(cx.theme().border)
-                            .child(nav),
-                    ),
+                    .children(nav),
             )
             .child(
                 h_flex()
@@ -2610,7 +2567,14 @@ impl Render for Workbench {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &Escape, window, cx| {
-                if this.raw_view.is_some() {
+                if this
+                    .document
+                    .as_mut()
+                    .is_some_and(|document| document.rail.dismiss_preview())
+                {
+                    cx.notify();
+                    return;
+                } else if this.raw_view.is_some() {
                     this.raw_view = None;
                 } else if this.find_visible {
                     this.close_find();

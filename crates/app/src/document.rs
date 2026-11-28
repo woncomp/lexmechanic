@@ -1,4 +1,4 @@
-use crate::runtime::DocumentMessage;
+use crate::{runtime::DocumentMessage, workbench::message_rail::RailState};
 use gpui_kit::{
     component::text::{RenderedText, TextViewState},
     *,
@@ -29,6 +29,7 @@ pub struct Document {
     pub pending: HashSet<(i64, usize)>,
     pub list: ListState,
     pub nav_scroll: UniformListScrollHandle,
+    pub rail: RailState,
     pub current: usize,
     pub complete: bool,
     pub loading: bool,
@@ -48,6 +49,7 @@ impl Document {
             pending: HashSet::new(),
             list: ListState::new(0, ListAlignment::Top, px(500.)),
             nav_scroll: UniformListScrollHandle::new(),
+            rail: RailState::default(),
             current: 0,
             complete: false,
             loading: true,
@@ -82,8 +84,14 @@ impl Document {
                 item_ix: index,
                 offset_in_item: px(0.),
             });
+            self.follow_current();
+        }
+    }
+
+    pub fn follow_current(&self) {
+        if !self.rail.exploring() && !self.messages.is_empty() {
             self.nav_scroll
-                .scroll_to_item(message, ScrollStrategy::Center);
+                .scroll_to_item(self.current, ScrollStrategy::Nearest);
         }
     }
 
