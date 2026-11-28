@@ -55,6 +55,14 @@ actions!(
 
 const TAB_HEIGHT: Pixels = px(32.);
 
+/// The data directories the user can add, one per kind of source.
+#[derive(Clone, Copy)]
+enum SourceKind {
+    Copilot,
+    VsCode,
+    Codex,
+}
+
 #[derive(Clone)]
 struct DraggedTab {
     key: String,
@@ -366,8 +374,9 @@ impl Workbench {
             show_settings: false,
             show_diagnostics: false,
             diagnostics: Vec::new(),
-            status: "Discovering Copilot CLI, Copilot App, VS Code and VS Code Agents sessions…"
-                .into(),
+            status:
+                "Discovering Copilot CLI, Copilot App, Codex, VS Code and VS Code Agents sessions…"
+                    .into(),
             progress: HashMap::new(),
             catalog_run: 0,
             search_state: String::new(),
@@ -909,6 +918,7 @@ impl Workbench {
         self.report(self.runtime.refresh(
             self.settings.sources.clone(),
             self.settings.vscode_sources.clone(),
+            self.settings.codex_sources.clone(),
         ));
         self.status = "Refreshing all sources, newest modified sessions first…".into();
         cx.notify();
@@ -1210,16 +1220,16 @@ impl Workbench {
         });
     }
 
-    fn pick_source(&mut self, vscode: bool, cx: &mut Context<Self>) {
+    fn pick_source(&mut self, kind: SourceKind, cx: &mut Context<Self>) {
         let prompt = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
             multiple: false,
             prompt: Some(
-                if vscode {
-                    "Select VS Code User directory"
-                } else {
-                    "Select Copilot home directory (CLI / App)"
+                match kind {
+                    SourceKind::VsCode => "Select VS Code User directory",
+                    SourceKind::Codex => "Select Codex home directory",
+                    SourceKind::Copilot => "Select Copilot home directory (CLI / App)",
                 }
                 .into(),
             ),
@@ -1228,10 +1238,14 @@ impl Workbench {
             Ok(Ok(Some(paths))) => {
                 let _ = this.update(cx, |this, cx| {
                     for path in paths {
-                        let sources = if vscode {
-                            this.settings.vscode_sources.get_or_insert_with(Vec::new)
-                        } else {
-                            &mut this.settings.sources
+                        let sources = match kind {
+                            SourceKind::VsCode => {
+                                this.settings.vscode_sources.get_or_insert_with(Vec::new)
+                            }
+                            SourceKind::Codex => {
+                                this.settings.codex_sources.get_or_insert_with(Vec::new)
+                            }
+                            SourceKind::Copilot => &mut this.settings.sources,
                         };
                         if !sources.contains(&path) {
                             sources.push(path);
@@ -1576,7 +1590,7 @@ impl Workbench {
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
                         .child(
-                            "Local only · Read-only · Copilot CLI / App / VS Code / VS Code Agents",
+                            "Local only · Read-only · Copilot CLI / App / Codex / VS Code / VS Code Agents",
                         ),
                 )
                 .into_any_element();
@@ -2014,14 +2028,27 @@ impl Workbench {
                             .ghost()
                             .small()
                             .label("Add Copilot home…")
-                            .on_click(cx.listener(|this, _, _, cx| this.pick_source(false, cx))),
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.pick_source(SourceKind::Copilot, cx)
+                            })),
                     )
                     .child(
                         Button::new("choose-vscode-source")
                             .ghost()
                             .small()
                             .label("Add VS Code User…")
-                            .on_click(cx.listener(|this, _, _, cx| this.pick_source(true, cx))),
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.pick_source(SourceKind::VsCode, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("choose-codex-source")
+                            .ghost()
+                            .small()
+                            .label("Add Codex home…")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.pick_source(SourceKind::Codex, cx)
+                            })),
                     )
                     .child(
                         Button::new("default-source")
@@ -2031,6 +2058,7 @@ impl Workbench {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.settings.sources.clear();
                                 this.settings.vscode_sources = None;
+                                this.settings.codex_sources = None;
                                 this.save_due = Some(Instant::now());
                                 this.refresh(cx);
                             })),
@@ -2120,6 +2148,22 @@ impl Workbench {
                         }
                         Some(roots) => format!(
                             "VS Code: {}",
+                            roots
+                                .iter()
+                                .map(|root| root.display().to_string())
+                                .collect::<Vec<_>>()
+                                .join(" · ")
+                        ),
+                    }),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(match &self.settings.codex_sources {
+                        None => "Codex: CODEX_HOME or ~/.codex".to_owned(),
+                        Some(roots) => format!(
+                            "Codex: {}",
                             roots
                                 .iter()
                                 .map(|root| root.display().to_string())

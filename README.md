@@ -1,10 +1,10 @@
 # AgentChatReader
 
-基于 Rust / GPUI 的 Windows x64 桌面会话阅读器。只读扫描本机 Agent 缓存，在一个工作台中浏览、搜索和导出历史对话。支持 **Copilot CLI、Copilot App、VS Code 中的 GitHub Copilot Chat，以及 VS Code Agents 窗口中的 Copilot / Codex / Claude 会话**；无需 GitHub 登录、Python 或模型服务。
+基于 Rust / GPUI 的 Windows x64 桌面会话阅读器。只读扫描本机 Agent 缓存，在一个工作台中浏览、搜索和导出历史对话。支持 **Copilot CLI、Copilot App、Codex、VS Code 中的 GitHub Copilot Chat，以及 VS Code Agents 窗口中的 Copilot / Codex / Claude 会话**；无需 GitHub 登录、Python 或模型服务。
 
 ## 使用
 
-运行便携包中的 `AgentChatReader.exe`。首次启动扫描 `COPILOT_HOME`（未设置时为 `%USERPROFILE%\.copilot`）中的 CLI / App 会话，并自动发现 `%APPDATA%\Code\User` 与 `%APPDATA%\Code - Insiders\User` 中的 VS Code Copilot 会话；存在 `globalStorage\agent-host.db` 时同时读取 VS Code Agents 会话（Codex 默认读 `CODEX_HOME` 或 `%USERPROFILE%\.codex`，Claude 默认读 `CLAUDE_CONFIG_DIR` 或 `%USERPROFILE%\.claude`）。可在 **Settings → Add Copilot home…** 选择包含 `session-state` 或 App `data.db` 的目录，在 **Add VS Code User…** 选择包含 `globalStorage` 和 `workspaceStorage` 的 VS Code `User` 目录。
+运行便携包中的 `AgentChatReader.exe`。首次启动扫描 `COPILOT_HOME`（未设置时为 `%USERPROFILE%\.copilot`）中的 CLI / App 会话，并自动发现 `%APPDATA%\Code\User` 与 `%APPDATA%\Code - Insiders\User` 中的 VS Code Copilot 会话；存在 `globalStorage\agent-host.db` 时同时读取 VS Code Agents 会话（Codex 默认读 `CODEX_HOME` 或 `%USERPROFILE%\.codex`，Claude 默认读 `CLAUDE_CONFIG_DIR` 或 `%USERPROFILE%\.claude`）。Codex 自身的会话默认读取同一个 Codex 目录，可在 **Add Codex home…** 选择其他包含 `sessions` 或 `archived_sessions` 的目录。可在 **Settings → Add Copilot home…** 选择包含 `session-state` 或 App `data.db` 的目录，在 **Add VS Code User…** 选择包含 `globalStorage` 和 `workspaceStorage` 的 VS Code `User` 目录。
 
 - 左侧四列表格：无标题的 Agent 图标列、日期、workspace、会话名。悬停图标显示对应 Agent 名称。Date 只显示 `MM-DD`，悬停显示完整本地日期、时间及 UTC 偏移；排序仍使用完整时间，不按月日文本排序。旧版列宽自动迁移，日期默认缩窄。
 - **扫描顺序与展示排序独立**：每个 Agent 在独立工作线程中按日志文件修改时间从新到旧扫描，覆盖全部历史；结果按消息时间插入统一总表。
@@ -29,6 +29,7 @@
 | Copilot CLI | `session-state\<id>\workspace.yaml` 中的 `client_name` / `last_client_name` 标记与名称 | `events.jsonl` 中的顶层用户和助手消息 |
 | Copilot App | 只读查询 `data.db` 的 `sessions` / `workspaces`；workspace 路径从 `workspace.yaml` 或 `session-store.db` 补充 | 同目录下的 `session-state\<id>\events.jsonl`，与 CLI 共用消息过滤规则 |
 | VS Code | `globalStorage\github.copilot-chat\session-store.db` 中的 Copilot Chat 会话；各 workspace 的 `state.vscdb` 中的标题索引 | `workspaceStorage\<workspace>\chatSessions\<id>.jsonl` 的会话快照与增量重放 |
+| Codex | 只读读取 Codex 目录中版本最高的 `state_<n>.sqlite` 的 `threads`（名称、`source`、`originator`）和 `session_index.jsonl` 的 `thread_name`；`session_index.jsonl` 的名称优先，缺失时用首条用户消息 | `sessions\Y\M\D` 与 `archived_sessions` 中的 `rollout-*-<thread>[_<page>].jsonl[.zst]`，读取 `item_completed` 的用户与助手消息 |
 | VS Code Agents - Copilot | 只读查询 `globalStorage\agent-host.db`（`sessions_v2` / `chats_v2`）中 `copilotcli` 会话的标题与工作目录 | 经 `sdkSessionId` 找到 `session-state\<sdk>\events.jsonl`，与 CLI 共用消息过滤规则 |
 | VS Code Agents - Claude | 同上，`claude` 会话 | 经 `sdkSessionId` 找到 `<claude>\projects\*\<sdk>.jsonl`，只保留真实用户提示和助手文字 |
 | VS Code Agents - Codex | 同上，`codex` 会话 | 经 `agentSessionData\<id>\session.db` 的 `codex.threadId` 找到 `sessions` 或 `archived_sessions` 中的 `rollout-*-<thread>.jsonl[.zst]`，读取 `item_completed` 的用户与助手消息 |
@@ -36,6 +37,8 @@
 `workspace.yaml` 中的 `last_client_name: github/cli` 优先识别为 Copilot CLI，包括从 Copilot App 分支后在 CLI 继续的会话，不受原始 `client_name` 或 App 数据库登记影响。没有此标记时，App 登记的会话优先归属 App，其余 `client_name: github/cli` 的会话归属 CLI。归属变化时会迁移标签、阅读位置和仍可读取的正文索引，避免重复显示。单一 workspace 的 App 名称优先于通用标题；没有本地日志但仍有本地目录或共享数据库记录的 App 会话可显示元数据，但排除正文索引与索引目标计数。
 
 VS Code 重放 `kind=0/1/2` 的快照、赋值和数组追加，仅显示可见 request 的用户文本与助手文字片段，过滤隐藏 request 和工具片段。标题索引不可用时使用快照标题或首条用户内容。同一会话存在多个 transcript 副本时使用最后修改时间最新的一份并显示诊断。VS Code 时间从 request 的 `timestamp` / `responseTimestamp` 提取（毫秒时间戳），不会用标题索引的活动时间冒充首条助手消息时间。
+
+Codex 只列出用户自己的会话：`source` 带 `subagent` 的线程（子 Agent、guardian 审查）不显示，`originator` 为 `vscode_agent_host` 的会话归 VS Code Agents - Codex。分类优先取 Codex 状态库的记录，库中没有该线程时才读取 rollout 首条记录。已归档的会话照常列出。续页拼接规则与 VS Code Agents - Codex 相同。重放压缩或分页的会话时，只解析包含 `item_completed` 或 `session_meta` 的行，其余工具输出与 token 记录不做 JSON 解析。
 
 VS Code Agents 只显示在 Agents 窗口中创建的会话（`external=0`、未删除的默认对话）；宿主仅从磁盘发现的会话不重复列出。`workspace.yaml` 属于 `github/cli` 的会话仍归 Copilot CLI。标题取宿主目录的摘要，工作目录优先取转写日志中的路径。转写缺失但有标题的会话显示为不可读，无标题且无转写的空会话不显示。Codex 的 `.jsonl.zst` 归档以快照方式整体解压重放（解压上限 1 GiB）；Codex 的长线程会续写到页文件（`rollout-*-<thread>_<page>.jsonl`）：以文件名时间最新的一页为会话文件，按每页首条记录 `history_base` 的 `thread_id` 与 `end_byte_offset` 逐级回溯，把更早文件截取到该偏移后依次拼接，页内被取代的尾部（如已中止的回合）不会显示；可跨越分叉到父线程。拼接后的会话按快照整体重放。找不到前序文件时只显示已有部分，并给出诊断提示。Claude 子 Agent 的转写（`subagents\`）不并入主对话。
 
@@ -86,14 +89,14 @@ GPUI Kit 与其匹配的 GPUI snapshot 由版本及 `Cargo.lock` 锁定；不要
 
 ## 结构与性能
 
-- `crates\core`：Agent 无关的身份和时间模型、同步适配接口、CLI / App / VS Code / VS Code Agents（Copilot、Claude、Codex）独立适配器、共享 Copilot 事件解析与 Claude / Codex 行式解析、每 Agent 扫描工作线程、SQLite 单写入通道、增量检查点与字面搜索。
+- `crates\core`：Agent 无关的身份和时间模型、同步适配接口、CLI / App / Codex / VS Code / VS Code Agents（Copilot、Claude、Codex）独立适配器、共享 Copilot 事件解析与 Claude / Codex 行式解析、每 Agent 扫描工作线程、SQLite 单写入通道、增量检查点与字面搜索。
 - `crates\app`：原生 GPUI 工作台、表格/标签状态、变高 Notebook、消息分段与导航、独立文档/搜索线程、用户操作驱动的快照、偏好持久化和导出。
 - 摘要扫描优先于历史正文索引；打开文档有独立的读取通道，不能排在全部历史索引之后。
 - UI 只渲染可见行和消息段。超长消息分段显示，避免一个巨型单元阻塞布局；长消息的分段使用纯文本代码视图以保持完整内容，**Copy** 和导出仍覆盖整条消息。
 - 正文/渲染状态有字节预算和实体数量限制，切换标签释放旧渲染状态。SQLite FTS5 trigram 缩小较长查询候选；短词采用可取消的精确扫描。旧请求不能覆盖新选择。
 - 追加解析只消费本次捕获文件长度内的新完整记录；半条 JSON 不会提前越过索引游标，也不会让搜索永久等待。文件截断、替换或检查点不一致在下一次用户操作中重建相应会话；中间坏行保留明确诊断，其他会话继续可用。
 - VS Code 的快照重放在后台按行读取并支持取消，最多保留一个已重放的会话，不将全部历史状态常驻内存；单个 VS Code 会话仍需还原完整状态，内存开销与该会话大小相关。
-- `assets\agents` 中的图标嵌入可执行文件；Copilot CLI 使用由提供的 Icons8 PNG 矢量重绘的 `copilot-cli.svg`，保留紫蓝渐变与青色细节，不内嵌位图。Copilot App 保持 PNG，VS Code 使用 SVG；VS Code Agents 的三个图标（`vscode-agents-{copilot,claude,codex}.svg`）为 Agents 立方体加右下角驱动标识，均为纯矢量；发行包不依赖原始图标路径。
+- `assets\agents` 中的图标嵌入可执行文件；Copilot CLI 使用由提供的 Icons8 PNG 矢量重绘的 `copilot-cli.svg`，保留紫蓝渐变与青色细节，不内嵌位图。Copilot App 保持 PNG，VS Code 使用 SVG；Codex 使用 OpenAI 单色标志（`codex.svg`，无底板），作为 Alpha 蒙版按当前主题前景色绘制，深色主题为白色、浅色主题为黑色；VS Code Agents 的三个图标（`vscode-agents-{copilot,claude,codex}.svg`）为 Agents 立方体加右下角驱动标识，均为纯矢量；发行包不依赖原始图标路径。
 - 可重建索引使用 SQLite WAL / NORMAL：事务中的正文、FTS 与游标保持原子一致，断电时尚未持久化的索引进度允许从原始日志重新生成；不以此降低原始数据或设置文件的持久化要求。
 
 ### 合成数据验证
@@ -123,4 +126,4 @@ cargo run -p agent-chat-reader-core --release --example fixtures -- scan target\
 
 ## 当前边界
 
-当前支持 Copilot CLI、Copilot App、VS Code Copilot Chat 以及 VS Code Agents 的 Copilot / Claude / Codex 会话，平台验收目标仍为 Windows x64。不提供其他 Agent 实现、工具时间线、子 Agent 树、自动摘要、语义搜索、编辑/继续对话或云同步。附件保持元数据视图；远程图片保持阻止状态。跨分段的鼠标拖选不合并为一次全消息选择，需要使用消息级 Copy；任意超长 Markdown 的分段优先保证原文完整，而非跨段格式连续。
+当前支持 Copilot CLI、Copilot App、Codex、VS Code Copilot Chat 以及 VS Code Agents 的 Copilot / Claude / Codex 会话，平台验收目标仍为 Windows x64。不提供其他 Agent 实现、工具时间线、子 Agent 树、自动摘要、语义搜索、编辑/继续对话或云同步。附件保持元数据视图；远程图片保持阻止状态。跨分段的鼠标拖选不合并为一次全消息选择，需要使用消息级 Copy；任意超长 Markdown 的分段优先保证原文完整，而非跨段格式连续。

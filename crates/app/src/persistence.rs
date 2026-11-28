@@ -13,6 +13,7 @@ use std::{
 pub struct Settings {
     pub sources: Vec<PathBuf>,
     pub vscode_sources: Option<Vec<PathBuf>>,
+    pub codex_sources: Option<Vec<PathBuf>>,
     pub mode: TimeMode,
     pub dark: Option<bool>,
     pub font_size: Option<f32>,

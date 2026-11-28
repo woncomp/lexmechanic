@@ -2,7 +2,7 @@ use crate::workbench::Workbench;
 use agent_chat_reader_core::model::{Session, TimeMode};
 use chrono::Local;
 use gpui_kit::{
-    component::{table::*, tooltip::Tooltip},
+    component::{ActiveTheme, table::*, tooltip::Tooltip},
     *,
 };
 use std::{cmp::Ordering, collections::HashMap, sync::Arc};
@@ -299,7 +299,7 @@ impl TableDelegate for SessionTable {
         row: usize,
         column: usize,
         _: &mut Window,
-        _: &mut Context<TableState<Self>>,
+        cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         if column == AGENT_COLUMN {
             let agent = self
@@ -317,6 +317,14 @@ impl TableDelegate for SessionTable {
                 .justify_center()
                 .tooltip(move |window, cx| Tooltip::new(name.clone()).build(window, cx));
             return match icon {
+                Some(path) if crate::assets::agent_icon_is_glyph(&agent) => cell
+                    .child(
+                        svg()
+                            .path(path)
+                            .size(px(18.))
+                            .text_color(cx.theme().foreground),
+                    )
+                    .into_any_element(),
                 Some(path) => cell
                     .child(img(path).size(px(18.)).object_fit(ObjectFit::Contain))
                     .into_any_element(),

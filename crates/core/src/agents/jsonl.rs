@@ -44,6 +44,10 @@ pub(super) trait Format {
     fn raw(record: &Value) -> Option<String>;
     /// Fills the fields of `header` that this record knows and are still empty.
     fn header(record: &Value, header: &mut Header);
+    /// A cheap test on the raw line: records that cannot matter are skipped without parsing.
+    fn wants(_line: &[u8]) -> bool {
+        true
+    }
 }
 
 pub(super) fn is_compressed(path: &Path) -> bool {
@@ -57,8 +61,8 @@ enum Line {
     Invalid,
 }
 
-fn parse_line(line: &[u8]) -> Line {
-    if line.iter().all(u8::is_ascii_whitespace) {
+fn parse_line<F: Format>(line: &[u8]) -> Line {
+    if !F::wants(line) || line.iter().all(u8::is_ascii_whitespace) {
         return Line::Blank;
     }
     match serde_json::from_slice(line) {
@@ -188,7 +192,7 @@ pub(super) fn summarize<F: Format>(
             exhausted = true;
             break;
         }
-        if let Line::Record(record) = parse_line(&line) {
+        if let Line::Record(record) = parse_line::<F>(&line) {
             F::header(&record, &mut header);
             if let Some(message) = F::message(&record, offset, offset + count as u64) {
                 if summary.name.is_empty() && message.role == Role::User {
@@ -262,7 +266,7 @@ pub(super) fn read_batch<F: Format>(
         for line in bytes.split_inclusive(|&byte| byte == b'\n') {
             cancel.check()?;
             let end = offset + line.len() as u64;
-            match parse_line(line) {
+            match parse_line::<F>(line) {
                 Line::Record(record) => batch.messages.extend(F::message(&record, offset, end)),
                 Line::Partial => batch.incomplete_tail = true,
                 Line::Invalid => batch.diagnostics.push(invalid(candidate, offset)),
@@ -290,7 +294,7 @@ pub(super) fn read_batch<F: Format>(
             break;
         }
         let offset = batch.cursor;
-        match parse_line(&line) {
+        match parse_line::<F>(&line) {
             Line::Record(record) => {
                 batch
                     .messages
@@ -363,7 +367,7 @@ fn tail_time<F: Format>(path: &Path, limit: u64, cancel: &Cancellation) -> Resul
     let mut position = limit;
     let mut remainder = Vec::new();
     let mut bytes = 0;
-    let last = |line: &[u8]| match parse_line(line) {
+    let last = |line: &[u8]| match parse_line::<F>(line) {
         Line::Record(record) => {
             F::message(&record, 0, 0).filter(|message| message.time.value().is_some())
         }

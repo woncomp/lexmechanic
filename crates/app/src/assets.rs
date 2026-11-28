@@ -3,10 +3,17 @@ use std::borrow::Cow;
 
 pub struct Assets;
 
+/// A single-colour mark drawn in the current text colour, so it suits both light and dark
+/// themes; the other icons keep their own colours.
+pub fn agent_icon_is_glyph(agent: &str) -> bool {
+    agent == "codex"
+}
+
 pub fn agent_icon(agent: &str) -> Option<&'static str> {
     match agent {
         "copilot-cli" => Some("agents/copilot-cli.svg"),
         "copilot-app" => Some("agents/copilot-app.png"),
+        "codex" => Some("agents/codex.svg"),
         "vscode" => Some("agents/vscode.svg"),
         "vscode-agents-copilot" => Some("agents/vscode-agents-copilot.svg"),
         "vscode-agents-claude" => Some("agents/vscode-agents-claude.svg"),
@@ -24,6 +31,7 @@ impl AssetSource for Assets {
             "agents/copilot-app.png" => {
                 Some(include_bytes!("../../../assets/agents/copilot-app.png"))
             }
+            "agents/codex.svg" => Some(include_bytes!("../../../assets/agents/codex.svg")),
             "agents/vscode.svg" => Some(include_bytes!("../../../assets/agents/vscode.svg")),
             "agents/vscode-agents-copilot.svg" => Some(include_bytes!(
                 "../../../assets/agents/vscode-agents-copilot.svg"
@@ -48,6 +56,7 @@ impl AssetSource for Assets {
             [
                 "agents/copilot-cli.svg",
                 "agents/copilot-app.png",
+                "agents/codex.svg",
                 "agents/vscode.svg",
                 "agents/vscode-agents-copilot.svg",
                 "agents/vscode-agents-claude.svg",
@@ -70,6 +79,7 @@ mod tests {
         for agent in [
             "copilot-cli",
             "copilot-app",
+            "codex",
             "vscode",
             "vscode-agents-copilot",
             "vscode-agents-claude",
@@ -83,10 +93,16 @@ mod tests {
                 let svg = std::str::from_utf8(&bytes).unwrap();
                 assert!(svg.contains("<svg"));
                 // Vector-only: the app must not depend on embedded bitmaps for these icons.
-                if agent == "copilot-cli" || agent.starts_with("vscode-agents-") {
+                if agent == "copilot-cli" || agent == "codex" || agent.starts_with("vscode-agents-")
+                {
                     assert!(svg.contains("<path"));
                     assert!(!svg.contains("<image"));
                     assert!(!svg.contains("data:image/"));
+                }
+                // A glyph is tinted through its alpha, so it must not carry a background.
+                if agent_icon_is_glyph(agent) {
+                    assert!(!svg.contains("<rect"));
+                    assert_eq!(svg.matches("<path").count(), 1);
                 }
             }
             assert!(

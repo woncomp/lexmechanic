@@ -1,3 +1,4 @@
+pub mod codex;
 pub mod copilot_app;
 pub mod copilot_cli;
 mod jsonl;
@@ -20,6 +21,7 @@ pub fn adapter_for(candidate: &Candidate) -> anyhow::Result<Arc<dyn AgentAdapter
     match candidate.key.agent.as_str() {
         "copilot-cli" => Ok(Arc::new(copilot_cli::CopilotCli::for_candidate(candidate)?)),
         "copilot-app" => Ok(Arc::new(copilot_app::CopilotApp::for_candidate(candidate)?)),
+        "codex" => Ok(Arc::new(codex::Codex::for_candidate(candidate)?)),
         "vscode" => Ok(Arc::new(vscode::VsCode::for_candidate(candidate)?)),
         agent if vscode_agents::Driver::from_agent(agent).is_some() => Ok(Arc::new(
             vscode_agents::VsCodeAgents::for_candidate(candidate)?,
@@ -32,6 +34,7 @@ pub fn agent_name(id: &str) -> &str {
     match id {
         "copilot-cli" => "Copilot CLI",
         "copilot-app" => "Copilot App",
+        "codex" => "Codex",
         "vscode" => "VS Code",
         "vscode-agents-copilot" => "VS Code Agents - Copilot",
         "vscode-agents-codex" => "VS Code Agents - Codex",

@@ -2,6 +2,7 @@ use crate::persistence::{self, Settings};
 use agent_chat_reader_core::{
     agents::{
         AgentAdapter,
+        codex::Codex,
         copilot_app::CopilotApp,
         copilot_cli::CopilotCli,
         vscode::VsCode,
@@ -156,7 +157,7 @@ enum SearchCommand {
 }
 
 enum ControlCommand {
-    Refresh(Vec<PathBuf>, Option<Vec<PathBuf>>),
+    Refresh(Vec<PathBuf>, Option<Vec<PathBuf>>, Option<Vec<PathBuf>>),
     Save(Settings),
     Clear,
     Search(SearchRequest),
@@ -280,11 +281,13 @@ impl Runtime {
                     }
                     let mut roots = settings.sources;
                     let mut vscode_roots = settings.vscode_sources;
+                    let mut codex_roots = settings.codex_sources;
                     let mut run_id = 1;
                     emit(&sender, Event::CatalogStarted { run_id }, &worker_stop)?;
                     let mut scan = Some(begin_scan(
                         &roots,
                         vscode_roots.as_deref(),
+                        codex_roots.as_deref(),
                         writer.clone(),
                         &sender,
                         &worker_stop,
@@ -293,15 +296,17 @@ impl Runtime {
                     while !worker_stop.is_cancelled() {
                         while let Ok(command) = commands.try_recv() {
                             match command {
-                                ControlCommand::Refresh(sources, vscode) => {
+                                ControlCommand::Refresh(sources, vscode, codex) => {
                                     scan.take();
                                     roots = sources;
                                     vscode_roots = vscode;
+                                    codex_roots = codex;
                                     run_id += 1;
                                     emit(&sender, Event::CatalogStarted { run_id }, &worker_stop)?;
                                     scan = Some(begin_scan(
                                         &roots,
                                         vscode_roots.as_deref(),
+                                        codex_roots.as_deref(),
                                         writer.clone(),
                                         &sender,
                                         &worker_stop,
@@ -334,6 +339,7 @@ impl Runtime {
                                     scan = Some(begin_scan(
                                         &roots,
                                         vscode_roots.as_deref(),
+                                        codex_roots.as_deref(),
                                         writer.clone(),
                                         &sender,
                                         &worker_stop,
@@ -437,9 +443,14 @@ impl Runtime {
         }
     }
 
-    pub fn refresh(&self, sources: Vec<PathBuf>, vscode: Option<Vec<PathBuf>>) -> Result<()> {
+    pub fn refresh(
+        &self,
+        sources: Vec<PathBuf>,
+        vscode: Option<Vec<PathBuf>>,
+        codex: Option<Vec<PathBuf>>,
+    ) -> Result<()> {
         self.control
-            .try_send(ControlCommand::Refresh(sources, vscode))
+            .try_send(ControlCommand::Refresh(sources, vscode, codex))
             .context("Refresh queue is busy")
     }
     pub fn save(&self, settings: Settings) -> Result<()> {
@@ -604,6 +615,7 @@ fn emit(sender: &SyncSender<Event>, mut event: Event, stop: &Cancellation) -> Re
 fn begin_scan(
     sources: &[PathBuf],
     vscode_sources: Option<&[PathBuf]>,
+    codex_sources: Option<&[PathBuf]>,
     writer: SharedWriter,
     sender: &SyncSender<Event>,
     stop: &Cancellation,
@@ -676,6 +688,20 @@ fn begin_scan(
                 }
                 Err(error) => emit(sender, Event::Error(format!("{error:#}")), stop)?,
             }
+        }
+    }
+    // Codex keeps its own home; without an explicit choice only an existing default is scanned.
+    let codex_roots = match codex_sources {
+        Some(roots) => roots.to_vec(),
+        None => vec![agent_chat_reader_core::agents::codex::default_home()?],
+    };
+    for root in codex_roots {
+        if codex_sources.is_some()
+            || root.join("sessions").is_dir()
+            || root.join("archived_sessions").is_dir()
+        {
+            vscode_adapters
+                .push(Codex::new(&root).map(|adapter| Arc::new(adapter) as Arc<dyn AgentAdapter>));
         }
     }
     for adapter in vscode_adapters {
@@ -1247,6 +1273,7 @@ mod tests {
             let settings = Settings {
                 sources: vec![home.clone()],
                 vscode_sources: Some(Vec::new()),
+                codex_sources: Some(Vec::new()),
                 ..Default::default()
             };
             persistence::save(&data.join("settings.json"), &settings).unwrap();
@@ -1520,7 +1547,11 @@ mod tests {
         fixture.append("needle addition");
         fixture.write_session(B, 1, "needle new member");
         reader
-            .refresh(fixture.settings.sources.clone(), Some(Vec::new()))
+            .refresh(
+                fixture.settings.sources.clone(),
+                Some(Vec::new()),
+                Some(Vec::new()),
+            )
             .unwrap();
         let (updated, _) = catalog(&reader);
         assert_eq!(updated.len(), 2);
@@ -1674,7 +1705,11 @@ mod tests {
         fs::remove_file(fixture.path(A)).unwrap();
         for _ in 0..2 {
             reader
-                .refresh(fixture.settings.sources.clone(), Some(Vec::new()))
+                .refresh(
+                    fixture.settings.sources.clone(),
+                    Some(Vec::new()),
+                    Some(Vec::new()),
+                )
                 .unwrap();
             let (sessions, progress) = catalog(&reader);
             assert_eq!(sessions.len(), 1);
