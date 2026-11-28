@@ -9,7 +9,8 @@ pub fn agent_icon_is_glyph(agent: &str) -> bool {
     agent == "codex"
 }
 
-pub fn agent_icon(agent: &str) -> Option<&'static str> {
+/// The icon for an agent; a few have separate artwork for the dark theme.
+pub fn agent_icon(agent: &str, dark: bool) -> Option<&'static str> {
     match agent {
         "copilot-cli" => Some("agents/copilot-cli.svg"),
         "copilot-app" => Some("agents/copilot-app.png"),
@@ -17,7 +18,8 @@ pub fn agent_icon(agent: &str) -> Option<&'static str> {
         "vscode" => Some("agents/vscode.svg"),
         "vscode-agents-copilot" => Some("agents/vscode-agents-copilot.svg"),
         "vscode-agents-claude" => Some("agents/vscode-agents-claude.svg"),
-        "vscode-agents-codex" => Some("agents/vscode-agents-codex.svg"),
+        "vscode-agents-codex" if dark => Some("agents/vscode-agents-codex-dark.svg"),
+        "vscode-agents-codex" => Some("agents/vscode-agents-codex-light.svg"),
         _ => None,
     }
 }
@@ -39,8 +41,11 @@ impl AssetSource for Assets {
             "agents/vscode-agents-claude.svg" => Some(include_bytes!(
                 "../../../assets/agents/vscode-agents-claude.svg"
             )),
-            "agents/vscode-agents-codex.svg" => Some(include_bytes!(
-                "../../../assets/agents/vscode-agents-codex.svg"
+            "agents/vscode-agents-codex-light.svg" => Some(include_bytes!(
+                "../../../assets/agents/vscode-agents-codex-light.svg"
+            )),
+            "agents/vscode-agents-codex-dark.svg" => Some(include_bytes!(
+                "../../../assets/agents/vscode-agents-codex-dark.svg"
             )),
             _ => None,
         };
@@ -60,7 +65,8 @@ impl AssetSource for Assets {
                 "agents/vscode.svg",
                 "agents/vscode-agents-copilot.svg",
                 "agents/vscode-agents-claude.svg",
-                "agents/vscode-agents-codex.svg",
+                "agents/vscode-agents-codex-light.svg",
+                "agents/vscode-agents-codex-dark.svg",
             ]
             .into_iter()
             .filter(|name| name.starts_with(path))
@@ -85,34 +91,46 @@ mod tests {
             "vscode-agents-claude",
             "vscode-agents-codex",
         ] {
-            let path = agent_icon(agent).unwrap();
-            let bytes = Assets.load(path).unwrap().unwrap();
-            if path.ends_with(".png") {
-                assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
-            } else {
-                let svg = std::str::from_utf8(&bytes).unwrap();
-                assert!(svg.contains("<svg"));
-                // Vector-only: the app must not depend on embedded bitmaps for these icons.
-                if agent == "copilot-cli" || agent == "codex" || agent.starts_with("vscode-agents-")
-                {
-                    assert!(svg.contains("<path"));
-                    assert!(!svg.contains("<image"));
-                    assert!(!svg.contains("data:image/"));
+            for dark in [false, true] {
+                let path = agent_icon(agent, dark).unwrap();
+                let bytes = Assets.load(path).unwrap().unwrap();
+                if path.ends_with(".png") {
+                    assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+                } else {
+                    let svg = std::str::from_utf8(&bytes).unwrap();
+                    assert!(svg.contains("<svg"));
+                    // An embedded bitmap must be inline; nothing may point at a file on disk.
+                    assert!(!svg.contains("file:"));
+                    if svg.contains("<image") {
+                        assert!(svg.contains("data:image/png;base64,"));
+                    }
+                    // Hand-drawn icons stay vector-only.
+                    if matches!(
+                        agent,
+                        "copilot-cli" | "codex" | "vscode-agents-copilot" | "vscode-agents-claude"
+                    ) {
+                        assert!(svg.contains("<path"));
+                        assert!(!svg.contains("<image"));
+                    }
+                    // A glyph is tinted through its alpha, so it must not carry a background.
+                    if agent_icon_is_glyph(agent) {
+                        assert!(!svg.contains("<rect"));
+                        assert_eq!(svg.matches("<path").count(), 1);
+                    }
                 }
-                // A glyph is tinted through its alpha, so it must not carry a background.
-                if agent_icon_is_glyph(agent) {
-                    assert!(!svg.contains("<rect"));
-                    assert_eq!(svg.matches("<path").count(), 1);
-                }
+                assert!(
+                    Assets
+                        .list("agents/")
+                        .unwrap()
+                        .iter()
+                        .any(|entry| entry == path)
+                );
             }
-            assert!(
-                Assets
-                    .list("agents/")
-                    .unwrap()
-                    .iter()
-                    .any(|entry| entry == path)
-            );
         }
+        assert_ne!(
+            agent_icon("vscode-agents-codex", false),
+            agent_icon("vscode-agents-codex", true)
+        );
         assert!(Assets.load("icons/check.svg").unwrap().is_some());
     }
 }

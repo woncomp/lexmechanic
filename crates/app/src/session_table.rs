@@ -307,7 +307,7 @@ impl TableDelegate for SessionTable {
                 .map(|session| session.candidate.key.agent.clone())
                 .unwrap_or_default();
             let name = agent_chat_reader_core::agents::agent_name(&agent).to_owned();
-            let icon = crate::assets::agent_icon(&agent);
+            let icon = crate::assets::agent_icon(&agent, cx.theme().is_dark());
             let cell = div()
                 .id(("session-agent", row))
                 .w_full()
