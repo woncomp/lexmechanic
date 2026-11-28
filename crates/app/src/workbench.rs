@@ -14,7 +14,7 @@ use gpui_kit::{
     component::{
         button::{Button, ButtonVariants},
         input::{Input, InputEvent, InputState},
-        menu::{ContextMenuExt, PopupMenuItem},
+        menu::{ContextMenuExt, DropdownMenu, PopupMenuItem},
         resizable::{ResizableState, h_resizable, resizable_panel},
         table::{DataTable, TableEvent, TableState},
         text::{RangeHighlight, TextView, TextViewState},
@@ -169,6 +169,7 @@ impl Workbench {
                     visible: Vec::new(),
                     mode: TimeMode::Latest,
                     filter: String::new(),
+                    agent_filter: None,
                     days: None,
                     selected: None,
                     widths: Vec::new(),
@@ -2438,6 +2439,31 @@ impl Render for Workbench {
         let sidebar = if self.search_mode {
             self.render_search(cx)
         } else {
+            let (agent_filter, mut agent_choices) = {
+                let table = self.table.read(cx);
+                let delegate = table.delegate();
+                (
+                    delegate.agent_filter.clone(),
+                    delegate
+                        .rows
+                        .iter()
+                        .map(|session| session.candidate.key.agent.clone())
+                        .collect::<HashSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>(),
+                )
+            };
+            agent_choices.sort_by(|left, right| {
+                agent_chat_reader_core::agents::agent_name(left)
+                    .cmp(agent_chat_reader_core::agents::agent_name(right))
+                    .then_with(|| left.cmp(right))
+            });
+            let agent_label = agent_filter
+                .as_deref()
+                .map(agent_chat_reader_core::agents::agent_name)
+                .unwrap_or("All agents")
+                .to_owned();
+            let menu_owner = cx.weak_entity();
             v_flex()
                 .size_full()
                 .min_h_0()
@@ -2471,6 +2497,57 @@ impl Render for Workbench {
                                         );
                                     });
                                 })),
+                        )
+                        .child(
+                            Button::new("agent-filter")
+                                .ghost()
+                                .small()
+                                .dropdown_caret(true)
+                                .label(agent_label)
+                                .dropdown_menu(move |mut menu, _, _| {
+                                    let owner = menu_owner.clone();
+                                    menu = menu.item(PopupMenuItem::new("All agents").on_click(
+                                        move |_, _, cx| {
+                                            let _ = owner.update(cx, |this, cx| {
+                                                this.table.update(cx, |table, cx| {
+                                                    SessionTable::update_rows(
+                                                        table,
+                                                        |data| {
+                                                            data.agent_filter = None;
+                                                            data.refilter();
+                                                        },
+                                                        cx,
+                                                    );
+                                                });
+                                            });
+                                        },
+                                    ));
+                                    for agent in &agent_choices {
+                                        let owner = menu_owner.clone();
+                                        let agent_id = agent.clone();
+                                        let label =
+                                            agent_chat_reader_core::agents::agent_name(agent)
+                                                .to_owned();
+                                        menu = menu.item(PopupMenuItem::new(label).on_click(
+                                            move |_, _, cx| {
+                                                let _ = owner.update(cx, |this, cx| {
+                                                    this.table.update(cx, |table, cx| {
+                                                        SessionTable::update_rows(
+                                                            table,
+                                                            |data| {
+                                                                data.agent_filter =
+                                                                    Some(agent_id.clone());
+                                                                data.refilter();
+                                                            },
+                                                            cx,
+                                                        );
+                                                    });
+                                                });
+                                            },
+                                        ));
+                                    }
+                                    menu
+                                }),
                         ),
                 )
                 .child(

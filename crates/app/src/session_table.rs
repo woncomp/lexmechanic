@@ -25,6 +25,7 @@ pub struct SessionTable {
     pub visible: Vec<usize>,
     pub mode: TimeMode,
     pub filter: String,
+    pub agent_filter: Option<String>,
     pub days: Option<i64>,
     pub selected: Option<String>,
     pub widths: Vec<f32>,
@@ -122,29 +123,13 @@ impl SessionTable {
     }
 
     pub fn refilter(&mut self) {
-        let filter = self.filter.to_lowercase();
-        let cutoff = self
-            .days
-            .map(|days| chrono::Utc::now() - chrono::Duration::days(days));
-        self.visible = self
-            .rows
-            .iter()
-            .enumerate()
-            .filter(|(_, session)| {
-                (filter.is_empty()
-                    || session
-                        .workspace
-                        .as_deref()
-                        .unwrap_or_default()
-                        .to_lowercase()
-                        .contains(&filter)
-                    || session.name.to_lowercase().contains(&filter))
-                    && cutoff.is_none_or(|cutoff| {
-                        session.time(self.mode).is_some_and(|time| time >= cutoff)
-                    })
-            })
-            .map(|(index, _)| index)
-            .collect();
+        self.visible = filtered_indices(
+            &self.rows,
+            &self.filter,
+            self.agent_filter.as_deref(),
+            self.days,
+            self.mode,
+        );
     }
 
     pub fn at(&self, index: usize) -> Option<Arc<Session>> {
@@ -191,6 +176,33 @@ impl SessionTable {
                 }
             })
     }
+}
+
+fn filtered_indices(
+    rows: &[Arc<Session>],
+    filter: &str,
+    agent_filter: Option<&str>,
+    days: Option<i64>,
+    mode: TimeMode,
+) -> Vec<usize> {
+    let filter = filter.to_lowercase();
+    let cutoff = days.map(|days| chrono::Utc::now() - chrono::Duration::days(days));
+    rows.iter()
+        .enumerate()
+        .filter(|(_, session)| {
+            agent_filter.is_none_or(|agent| session.candidate.key.agent == agent)
+                && (filter.is_empty()
+                    || session
+                        .workspace
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_lowercase()
+                        .contains(&filter)
+                    || session.name.to_lowercase().contains(&filter))
+                && cutoff.is_none_or(|cutoff| session.time(mode).is_some_and(|time| time >= cutoff))
+        })
+        .map(|(index, _)| index)
+        .collect()
 }
 
 fn compare(a: &Session, b: &Session, mode: TimeMode, column: usize, descending: bool) -> Ordering {
@@ -408,6 +420,51 @@ mod tests {
             available: true,
             content_error: None,
         }
+    }
+
+    fn with_agent(mut session: Session, agent: &str, name: &str) -> Session {
+        session.candidate.key.agent = agent.into();
+        session.name = name.into();
+        session
+    }
+
+    #[test]
+    fn provider_filter_composes_with_text_and_date_filters() {
+        let rows = vec![
+            Arc::new(with_agent(
+                session("2099-01-02T12:00:00Z", "2099-01-02T11:00:00Z"),
+                "codex",
+                "Release plan",
+            )),
+            Arc::new(with_agent(
+                session("2099-01-02T12:00:00Z", "2099-01-02T11:00:00Z"),
+                "vscode",
+                "Release plan",
+            )),
+            Arc::new(with_agent(
+                session("2099-01-02T12:00:00Z", "2099-01-02T11:00:00Z"),
+                "codex",
+                "Draft notes",
+            )),
+            Arc::new(with_agent(
+                session("2000-01-02T12:00:00Z", "2000-01-02T11:00:00Z"),
+                "codex",
+                "Release archive",
+            )),
+        ];
+
+        assert_eq!(
+            filtered_indices(&rows, "", None, None, TimeMode::Latest),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(
+            filtered_indices(&rows, "", Some("codex"), None, TimeMode::Latest),
+            vec![0, 2, 3]
+        );
+        assert_eq!(
+            filtered_indices(&rows, "release", Some("codex"), Some(7), TimeMode::Latest),
+            vec![0]
+        );
     }
 
     #[test]
