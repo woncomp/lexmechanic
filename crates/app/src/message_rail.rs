@@ -57,7 +57,14 @@ pub(crate) struct RailState {
 
 impl RailState {
     pub fn exploring(&self) -> bool {
-        self.pointer_inside || self.has_focus
+        self.pointer_inside
+    }
+
+    pub fn follow(&mut self, message: Option<i64>) {
+        if self.has_focus {
+            self.focus = message;
+            self.focus_preview = false;
+        }
     }
 
     pub fn focus(&mut self, message: Option<i64>) {
@@ -484,17 +491,20 @@ mod tests {
     }
 
     #[test]
-    fn focus_and_hover_pause_follow_independently() {
+    fn hover_pauses_follow_and_focus_tracks_current() {
         let mut state = RailState::default();
         state.pointer_inside = true;
         state.focus(Some(42));
         assert!(state.exploring());
         assert!(state.preview_for(42));
-        state.blur();
-        assert!(state.exploring());
+        state.follow(Some(43));
+        assert!(!state.preview_for(43));
+        assert!(!state.preview_for(42));
         state.pointer_inside = false;
         assert!(!state.exploring());
-        assert!(!state.preview_for(42));
+        state.blur();
+        state.follow(Some(44));
+        assert_eq!(state.focus, Some(43));
     }
 
     #[test]

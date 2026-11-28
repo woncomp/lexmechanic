@@ -82,6 +82,8 @@ impl Document {
     pub fn jump(&mut self, message: usize) {
         if let Some(index) = self.rows.iter().position(|row| row.message == message) {
             self.current = message;
+            self.rail
+                .follow(self.messages.get(message).map(|message| message.info.rowid));
             self.list.scroll_to(ListOffset {
                 item_ix: index,
                 offset_in_item: px(0.),
@@ -118,6 +120,8 @@ impl Document {
         }
         if self.rows[index].message != self.current {
             self.current = self.rows[index].message;
+            self.rail
+                .follow(Some(self.messages[self.current].info.rowid));
             self.follow_current();
         }
     }
